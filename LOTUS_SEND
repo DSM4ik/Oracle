@@ -7,7 +7,7 @@ AS
   
   PROCEDURE send_header(name IN VARCHAR2, header IN VARCHAR2) AS
   BEGIN
-    UTL_SMTP.WRITE_DATA(mail_connect, name || ': ' || header || UTL_TCP.CRLF);
+    UTL_SMTP.WRITE_DATA(fgfgmail_connect, name || ': ' || header || UTL_TCP.CRLF);
   END send_header;
  
  --перекодируем тему письма
@@ -38,7 +38,7 @@ AS
                   )
       )
       ||'?=';
-  END;
+  END;fg
   
 BEGIN
   
@@ -60,7 +60,7 @@ BEGIN
     UTL_SMTP.OPEN_DATA(mail_connect);
       send_header('From', 'OracleServer');
       send_header('To', 'PlansDepartment');
-      send_header('Subject', encode_theme(theme));
+      send_header('Subject', encode_theme(theme));fgfg
       UTL_SMTP.WRITE_RAW_DATA(mail_connect, utl_raw.cast_to_raw(final_text)); 
     
     UTL_SMTP.CLOSE_DATA(mail_connect);
