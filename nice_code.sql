@@ -27,8 +27,7 @@ select RTRIM('один     ') from dual;                                  --ус
 select TRIM('   один  ') from dual;                                   --усечение пробелов в строке
 select TRUNC(SYSDATE) from dual;                                      --усечение дат
 select TRUNC(SYSDATE, 'yyyy') from dual;                              --получаем 01.01.год
-
--------------- краткая сводка числовых функций
+-------------- -краткая сводка числовых функций
 select TO_NUMBER('123,45') + 6.6 from dual;                           --преобразует строки фиксированной и переменной длины, а также вещественные типы IEEE-754 к типу NUMBER
 select CAST('1234' as number) from dual;                              --преобразование совместимое со стандартами ANSI
 select CEIL(15.3) from dual;                                          --окрушление в большую сторону целого
