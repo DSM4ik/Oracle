@@ -1,0 +1,37 @@
+with t as 
+(
+select month, val, rownum as rnum from
+       (select '1month' as month, 60 as val from dual
+        union
+        select '2month' as month, 100 as val from dual
+        union
+        select '3month' as month, null as val from dual
+        union
+        select '4month' as month, null as val from dual
+        union
+        select '5month' as month, null as val from dual
+        union
+        select '6month' as month, 105 as val from dual
+        union
+        select '7month' as month, null as val from dual
+        union
+        select '8month' as month, 250 as val from dual
+        )q
+)
+
+select month,
+       val, 
+       (case when val is null THEN
+                                (select max(val) from t where (t.val is not null) and (t.rnum < t2.rnum)) +   
+                                (
+                                (
+                                ((select val from t where (t.val is not null) and (t.rnum > t2.rnum) and (rownum = 1)) -
+                                (select max(val) from t where (t.val is not null) and (t.rnum < t2.rnum))) /
+                                ((select rnum from t where (t.val is not null) and (t.rnum > t2.rnum) and (rownum = 1))- 
+                                (select max(rnum) from t where (t.val is not null) and (t.rnum < t2.rnum))
+                                )
+                                )*(t2. rnum -(select max(rnum) from t where (t.val is not null) and (t.rnum < t2.rnum)))  
+                                ) 
+             else val end) as newval5,
+       rnum 
+from t t2
