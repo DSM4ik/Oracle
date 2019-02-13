@@ -1,0 +1,18 @@
+select substr('aaa;bbb;ccc;40817810568812458;e;;g;h', 1,instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)) ||
+       substr(
+       substr('aaa;bbb;ccc;40817810568812458;e;;g;h',
+               instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1,
+                     instr(substr('aaa;bbb;ccc;40817810568812458;e;;g;h',instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1 ),';')-1),
+                     1,6) ||
+       rpad('*',length(substr('aaa;bbb;ccc;40817810568812458;e;;g;h',
+               instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1,
+                     instr(substr('aaa;bbb;ccc;40817810568812458;e;;g;h',instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1 ),';')-1))-10,'*') ||
+       substr(
+       substr('aaa;bbb;ccc;40817810568812458;e;;g;h',
+               instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1,
+                     instr(substr('aaa;bbb;ccc;40817810568812458;e;;g;h',instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1 ),';')-1),
+                     length( substr('aaa;bbb;ccc;40817810568812458;e;;g;h',
+                                 instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1,
+                             instr(substr('aaa;bbb;ccc;40817810568812458;e;;g;h',instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,3)+1 ),';')-1))-3) ||
+       substr('aaa;bbb;ccc;40817810568812458;e;;g;h',instr('aaa;bbb;ccc;40817810568812458;e;;g;h', ';',1,4))
+       from dual;                      
