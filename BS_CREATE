@@ -1,0 +1,2285 @@
+create or replace package body BS_CREATE is
+
+MaxDate date;
+MinDate date;
+FlagFoto number;
+------------------------------------------------------------------------------------------------------------
+
+-- уточнение типа клиента из кредитного модуля. Касаета кредитных портфелей
+Function FineDetectCcusFlag_CD(v_caccacc in XXI.acc.CACCACC%type) return nvarchar2  is 
+  CcusFlag_CD  lib_ccusflag.ccusflag%type; 
+  
+  begin 
+   --ПОС
+    select   to_char(u.ICDPTNUMC) into CcusFlag_CD          
+    from XXI.cdpt_acc ct, XXI.cdpt u 
+    where u.ICDPTID=ct.NCDPTACCID and ct.CCDPTACCACC=v_caccacc;
+             
+  return CcusFlag_CD;
+end FineDetectCcusFlag_CD;
+
+-------------------------------------------------------------------------------------------------------------
+-- удаляем счета, которы были внесены в базу XXI ошибочно
+procedure DELETE_ACC_BAD (cIdsmr in number) is
+n number;
+  
+begin
+ UpdTime_LOG (N,'InsertNewAcc','Удаляем счета и связанные с ними проводки, которые были внесены в базу XXI ошибочно'); 
+ 
+for cur in --проверяем отсутствующие счета и остатки по ним
+     (SELECT distinct z.id_acc, z.caccacc,z.cacccur 
+      FROM lib_acc_bs z 
+      where z.id_acc not in ( SELECT p.id_acc FROM bs_ost p )  and z.id_acc!=0 --проверяем отсутствующие счета и остатки по ним
+        and z.caccacc   not in (SELECT t.CACCACC FROM xxi.acc t) 
+        and not exists(SELECT zt.id_type_trn  --проверяем наличие проводок по отсутствующим счетам 
+                       FROM lib_trn_pl zt 
+                       where z.caccacc in (zt.acc_staff, zt.acc)
+                          and not exists (SELECT tr.itrnnum FROM PL_TRN tr where tr.id_type_trn=zt.id_type_trn))
+				and z.id_acc in (SELECT p.id_acc FROM lib_acc_otd_period p,lib_otd	o where o.id_otd=p.id_otd and o.idsmr=cIdsmr)
+				)							
+                              
+      loop                                  
+              --  delete FROM lib_trn_pl l where (cur.caccacc=l.acc_staff and cur.cacccur=l.ctrncur_s) 
+              --                              or (cur.caccacc=l.acc and cur.cacccur=l.ctrncur_a);                                         
+                delete from lib_acc_bs p where p.id_acc=cur.id_acc;      
+end loop;
+
+UpdTime_LOG (N,'','',0);
+
+end DELETE_ACC_BAD;
+
+
+----------------------------------------------------------------------------------------------------------------
+-- ЗАГРУЗКА ТИПОВ СЧЕТОВ
+procedure UPDATE_LIB_ACC_TYPE  is
+  n number;
+  
+  
+begin  
+      -- вставляем новые счета и типы счетов в таблицу типов счетов
+      UpdTime_LOG (N,'InsertNewAcc','вставляем новые счета и типы счетов в LIB_ACC_TYPE');     
+  
+     -- загружаем типы счетов кредитного модуля 
+          
+    INSERT  /*+ APPEND */  INTO LIB_ACC_TYPE (CACCACC,CACCCUR,ICDACCTYPE,ID_ACC,CCUSFLAG, MODUL_ACCTYPE,POS)
+      SELECT distinct a.CACCACC,a.CACCCUR, cb.ICDACCTYPE,a.ID_ACC, 
+            nvl(cb.ccusflag,a.ccusflag) as ccusflag, cb.MODUL_ACCTYPE, cb.pos    
+      FROM  (select ct.CCDPTACCACC as  cdacc, ct.ICDPTACCTYPE as ICDACCTYPE, u.ICDPTNUMC as ccusflag,  'Credit' as MODUL_ACCTYPE,     
+             (case   when lower(u.CCDPTNAME) like '%ипотеч%' and u.ICDPTNUMC=1  then 'POS_IPOTEKA' 
+                    else  'POS' end ) as POS  
+             from XXI.cdpt_acc ct, XXI.cdpt u  where u.ICDPTID=ct.NCDPTACCID --ПОС
+                          union 
+            select c.cdacc, c.typacc as ICDACCTYPE, NULL as ccusflag,  'Credit' as MODUL_ACCTYPE, NULL as POS
+            from xxi.cbacc c -- кредитные договра
+                          union
+            select l.C_LABD_ACC as CACCACC,l.I_LABD_LABA_ID as ICDACCTYPE,  NULL as ccusflag,'Garant' as MODUL_ACCTYPE, NULL as POS 
+            from XXI.LABD l -- загружаем типы счетов  модуля  Гарантии        
+             ) cb,
+            xxi."CD_ACCTYPE" t,xxi.acc z, LIB_ACC_BS a                   
+      where cb.cdacc = z.caccacc and a.caccacc=z.CACCACC
+                     and cb.ICDACCTYPE = t.icd_accid
+                     and cb.cdacc IS NOT NULL  and not substr(cb.cdacc,1,5) = '10000'
+                     and not exists (SELECT f.id_acc FROM LIB_ACC_TYPE f where f.ICDACCTYPE=cb.ICDACCTYPE and f.ID_ACC=a.ID_ACC ) ;                
+      commit; 
+      
+       UpdTime_LOG (N,'','',0);
+
+end UPDATE_LIB_ACC_TYPE;
+
+
+---------------------------------------------------------------------------------------------------------------
+
+-- определяем статью BS для группы клиентов. Темпоральный параметр
+FUNCTION Decode_ID_CodeBS_Client(cntiacccus in xxi.cus.icusnum%type,
+                                 cntid_cod_bs in lib_cod_bs.id_cod_bs%type, cntDateBeg in date, cntDateEnd in date )return number is N number;
+
+
+begin 
+
+SELECT  
+        ( case
+            when  not cntid_cod_bs in (SELECT p.id_cod_bs_old
+                                      FROM   lib_podmen_cod_bs p
+                                      where  p.metka in ('Корпорат','Крупные','Выделенный клиент'))
+            then   cntid_cod_bs
+
+          else
+            (case
+              when (SELECT Cl.Groupclient
+                    FROM  groupclient Cl
+                    where Cl.id_client=cntiacccus
+                     and  Cl.Groupclient in ('Корпорат','Крупные','Выделенный клиент')                     
+                     and  Cl.date_beg<= cntDateBeg  and Cl.date_end> cntDateEnd 
+                     and exists(SELECT p.id_cod_bs_new 
+                                FROM  lib_podmen_cod_bs p 
+                                where  p.id_cod_bs_old= cntid_cod_bs
+                                   and p.metka =Cl.Groupclient )
+                     ) is NULL
+              then cntid_cod_bs
+              else
+                   (SELECT distinct p.id_cod_bs_new
+                   FROM  lib_podmen_cod_bs p
+                   where   p.id_cod_bs_old= cntid_cod_bs
+                      and  p.metka in (SELECT Cl.Groupclient
+                                       FROM  groupclient Cl
+                                       where Cl.id_client=cntiacccus
+                                        and  Cl.Groupclient in ('Корпорат','Крупные','Выделенный клиент')
+                                        and  Cl.date_beg<= cntDateBeg  and Cl.date_end> cntDateEnd ) )
+              end)
+
+          end) into N
+from DUAL ;
+
+return  N;
+end;
+
+
+
+
+             
+---------------------------------------------------------------------------------------------------------------------
+-- обновляем отделения в LIB_OTD
+procedure Update_LIB_OTD (cIDSMR in xxi.acc.IDSMR%type) is
+      -- обновляем отделения в LIB_OTD
+  
+      
+    begin     
+     -- подключаем окружение
+      idsmr_switch(cIDSMR);
+    
+    UpdTime_LOG (N,'InsertNewAcc','Обновляем/Добавляем  код отделения в  Update_LIB_OTD');
+      merge into lib_otd  o
+      using(SELECT ot.IOTDNUM, ot.COTDNAME,ot.IDSMR,ot.IOTDCUS  FROM XXI.otd ot )  d
+       on (o.IOTDNUM=d.IOTDNUM and d.IDSMR=o.IDSMR)
+      when matched then
+            UPDATE SET   o.cotdname=d.COTDNAME,
+                         o.IOTDCUS= d.IOTDCUS
+      when not matched then    
+          insert (IOTDNUM, COTDNAME,IDSMR,IOTDCUS,ID_OTD)
+          values(d.IOTDNUM, d.COTDNAME,d.IDSMR,d.IOTDCUS,(SELECT max(l.id_otd)+1 FROM lib_otd l) );
+          
+      commit;      
+    UpdTime_LOG (N,'','',0);
+      
+End Update_LIB_OTD;
+
+
+
+---------------------------------------------------------------------------------------------------------------------
+--обновляем библиотеку Групп типов целей индивидуальных кредитных договоров LIB_CREDITGROUPDOG. 
+ --Библиотека необходима для формирования информации по РВПС в отношении индивидуальных кредитов. 
+ --Библиотеку необходимо уточнять на предмет привязки к типу кредита адином базы. 
+procedure Update_LIB_CREDITGROUPDOG  is
+
+begin
+  merge into LIB_CREDITGROUPDOG h
+  using (select distinct c.icauid, c.ccauname, cu.ccusflag,
+         (case when cu.ccusflag=1 then 'Ипотечный кредит' else 'ЮрЛица кредит' end) CREDITGROUPNAME_NEW
+         from XXI."CAU" c, XXI."cus" cu
+         where 
+               exists (SELECT a.IACCCUS 
+                       FROM XXI."acc" a, (SELECT t.ICDAPURPOSE icauid, CDTerms.Get_LoanACC(t.ncdaAGRID) CACCACC 
+                                         FROM XXI."cda" t 
+                                         where t.DCDASTARTED>=to_date('01.01.2016','dd.mm.yyyy')) tx 
+                       where cu.icusnum=a.IACCCUS 
+                         and c.icauid=tx.icauid            
+                         and a.CACCACC=tx.CACCACC) ) x
+  on (x.icauid=h.icauid and x.ccusflag=h.ccusflag)                       
+  when matched then
+    update set h.ccauname=x.ccauname                       
+  when not matched then
+    insert (icauid, ccauname, ccusflag,CREDITGROUPNAME)
+    values (x.icauid, x.ccauname, x.ccusflag,x.CREDITGROUPNAME_NEW) ;
+             
+             
+End Update_LIB_CREDITGROUPDOG;
+
+
+
+----------------------------------------------------------------------------------------------------------------------------
+
+-- обновляем  код клиента в LIB_acc_bs и в pl_trn
+procedure Update_LIB_ACC_BS_cus   is
+       -- обновляем  код клиента в LIB_acc_bs
+       
+-- курсор для уточнения статьи по типу клиента  
+ cursor ClientCur  is
+        SELECT ac.IACCCUS, ac.CACCACC FROM XXI.acc ac,LIB_acc_bs a where a.caccacc=ac.CACCACC and a.IACCCUS!=ac.IACCCUS;        
+       
+begin 
+      
+    UpdTime_LOG (N,'InsertNewAcc','обновляем  код клиента в LIB_acc_bs');
+		
+    FOR ref_Cur in ClientCur
+    loop  
+      
+      update  LIB_acc_bs a 
+        set a.iacccus=ref_Cur.Iacccus,
+            a.flag_new_account=1,
+            a.dateupdate=trunc(sysdate)  
+        where a.caccacc=ref_Cur.CACCACC;
+       commit;  
+        
+        update pl_trn t 
+        set t.iacccus=ref_Cur.Iacccus 
+        where exists(SELECT 1 FROM LIB_TRN_PL p where p.acc=ref_Cur.CACCACC and t.id_type_trn=p.id_type_trn);      
+      commit;
+        
+        update LIB_TRN_PL t 
+        set t.iacccus=ref_Cur.Iacccus,
+            t.flag_new_account=1,
+            t.dateupdate=trunc(sysdate) 
+        where t.acc=ref_Cur.CACCACC;      
+      commit;
+     
+       
+    end loop;  
+      
+    /*  update  LIB_acc_bs a set a.iacccus=(SELECT ac.IACCCUS FROM XXI.acc ac where a.caccacc=ac.CACCACC  ) 
+      where  ( 
+             exists (SELECT ac.IACCCUS FROM XXI.acc ac where a.caccacc=ac.CACCACC and a.IACCCUS!=ac.IACCCUS))
+             and exists (SELECT ac.IACCCUS FROM XXI.acc ac where a.caccacc=ac.CACCACC);             
+       commit;      */    
+            
+    UpdTime_LOG (N,'','',0);
+      
+End Update_LIB_ACC_BS_cus;
+--------------------------------------------------------------------------------------------------------------------
+-- обновляем тип клиента
+procedure Update_LIB_acc_bs_ccusflag  is
+      -- обновляем тип клиента
+ N number;
+ begin 
+  UpdTime_LOG (N,'InsertNewAcc','обновляем  тип клиента в LIB_acc_bs'); 
+    update LIB_acc_bs a 
+              set a.ccusflag=(SELECT distinct  to_char(nvl(ac.ccusflag, 2)) ccusflag FROM XXI."cus" AC where ac.icusnum=a.iacccus ),
+                  a.flag_new_account=1,
+                  a.dateupdate=trunc(sysdate)
+    where exists (SELECT ac.ccusflag FROM XXI."cus" AC where ac.icusnum=a.iacccus and a.ccusflag!=ac.ccusflag) 
+     -- and (a.flag_new_account=FlagUpdateNewBS or a.ccusflag is null)
+			;   
+ 
+    UpdTime_LOG (N,'','',0);    
+      
+      UpdTime_LOG (N,'','',0);
+End Update_LIB_acc_bs_ccusflag;
+
+----------------------------------------------------------------------------------------------------------------------------------------
+-- выявляем новые счета второго порядка и пишем их в LIB_BS
+procedure INSERT_ACC2_To_LIB_BS  is
+     -- выявляем новые счета второго порядка и пишем их в LIB_BS
+
+ N  number;
+ begin  
+
+
+   UpdTime_LOG (N,'INSERT_LIB_BS_NEWACC2','первичная расскраска статьями бюджета в LIB_acc_bs');
+      insert into LIB_BS (acc_2,nameacc_2,typeacc,id_cod_bs,id_segment, znak,primechanfed,dacrdate,datenext,CCUSFLAG)
+      SELECT distinct substr(d.caccacc,1,5),
+         nvl((SELECT distinct b.nameacc_2 FROM LIB_BS b where b.acc_2=substr(d.caccacc,1,5)),'Новый счет'),
+         d.typeacc,138,2,1,sysdate,MinDate,MaxDate,d.ccusflag FROM BS_TEMP d 
+      where  not exists (SELECT bs.acc_2 FROM LIB_BS bs where substr(d.caccacc,1,5)=bs.acc_2 and d.ccusflag=bs.ccusflag);     
+            
+      commit; 
+   
+      UpdTime_LOG (N,'','',0);
+End INSERT_ACC2_To_LIB_BS;
+
+----------------------------------------------------------------------------------------------------------------------------------------
+ -- Вставляем новые счета и обновляем сегментацию статей,знак статьи,первичная расскраска статьми бюджета
+procedure Update_Lib_Acc_Bs_Period_AtrBS (DateBeg in date, FlagUpdateNewBS in number) is
+     -- Вставляем новые счета и обновляем сегментацию статей,знак статьи,первичная расскраска статьми бюджета
+     -- привязка статей бюджета кратна 1 году
+ N number;
+
+ DateBeg_Year date;
+ vDateUpdate timestamp;
+ begin
+ 
+ DateBeg_Year:=trunc(DateBeg,'yyyy');  
+ vDateUpdate:=trunc(sysdate);
+  
+   UpdTime_LOG (N,'InsertNewAcc','Добавление новых счетов и первичная расскраска статьями бюджета в Lib_Acc_Bs_Period');
+      merge into  Lib_Acc_Bs_Period z
+      
+      using (SELECT a.id_acc, bs.id_cod_bs,bs.id_segment,bs.znak,bs.dacrdate,bs.datenext 
+             FROM Lib_Acc_Bs a, lib_bs bs 
+             where substr(a.caccacc,1,5)=bs.acc_2 
+               and bs.ccusflag=a.ccusflag
+               and bs.dacrdate<=DateBeg_Year and  bs.Datenext>DateBeg_Year  
+               and (a.flag_new_account=FlagUpdateNewBS)) d
+      on (z.id_acc=d.id_acc and z.dacrdate=d.dacrdate)
+      
+      when matched then
+         update set z.id_cod_bs =d.id_cod_bs,
+                    z.id_segment=d.id_segment,
+                    z.znak=d.znak,
+                    z.procedureupdate='Первичная кодировка BS',                   
+                    z.datenext=d.datenext,
+                    z.dateupdate=vDateUpdate
+      when not matched then 
+          insert (id_acc, id_cod_bs,id_segment,znak,dacrdate,datenext,procedureupdate,dateupdate)                        
+          values (d.id_acc, d.id_cod_bs,d.id_segment,d.znak,d.dacrdate,d.datenext,'Первичная кодировка BS',vDateUpdate);
+    
+      
+         commit;
+      UpdTime_LOG (N,'','',0);
+End Update_Lib_Acc_Bs_Period_AtrBS;
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+ --уточняем тип  коды статей и сегментов РВПС по ПОС используюя тип клиента из ПОС кредитного модуля.
+procedure Update_Lib_Acc_Bs_Period_POS (DateBeg in date, FlagUpdateNewBS in number) is
+     
+ N number;
+
+ DateBeg_Year date;
+ vDateUpdate timestamp;
+ begin
+ 
+ DateBeg_Year:=trunc(DateBeg,'yyyy');  
+ vDateUpdate:=trunc(sysdate);
+ 
+ UpdTime_LOG (N,'InsertNewAcc','Уточнение кода и статьи по типу клиента ПОС КредМод');
+      merge into  Lib_Acc_Bs_Period z      
+      using (SELECT distinct a.id_acc, bs.id_cod_bs,bs.id_segment,bs.znak,bs.dacrdate,bs.datenext 
+             FROM Lib_Acc_Bs a, lib_bs bs 
+             where substr(a.caccacc,1,5)=bs.acc_2              
+               and bs.dacrdate<=DateBeg_Year and  bs.Datenext>DateBeg_Year  
+               and a.flag_new_account=FlagUpdateNewBS 
+               and exists (SELECT ct.NCDPTACCID 
+                           FROM XXI."cdpt_acc" ct, XXI."cdpt" u 
+                           where u.ICDPTID=ct.NCDPTACCID 
+                             and ct.CCDPTACCACC=a.caccacc 
+                             and bs.ccusflag=to_char(u.ICDPTNUMC))) d
+      on (z.id_acc=d.id_acc and z.dacrdate=d.dacrdate)
+      
+      when matched then
+         update set z.id_cod_bs =d.id_cod_bs,
+                    z.id_segment=d.id_segment,
+                    z.znak=d.znak,
+                    z.procedureupdate='Уточнение кода и статьи по типу клиента ПОС КредМод',                   
+                    z.datenext=d.datenext,
+                    z.dateupdate=vDateUpdate
+      
+      when not matched then 
+          insert (id_acc, id_cod_bs,id_segment,znak,dacrdate,datenext,procedureupdate,dateupdate)                        
+          values (d.id_acc, d.id_cod_bs,d.id_segment,d.znak,d.dacrdate,d.datenext,'Уточнение кода и статьи по типу клиента ПОС КредМод',vDateUpdate);
+    
+      
+         commit;
+      UpdTime_LOG (N,'','',0);
+End Update_Lib_Acc_Bs_Period_POS;
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+ --Уточнение кода и статьи Обеспечения по типу клиента договора КредМод
+procedure Update_Lib_Acc_Bs_Period_CZO (DateBeg in date, FlagUpdateNewBS in number) is
+     
+ N number;
+
+ DateBeg_Year date;
+ vDateBeg date;
+ vDateUpdate timestamp;
+ 
+ 
+ begin
+ 
+ DateBeg_Year:=trunc(DateBeg,'yyyy');  
+ vDateUpdate:=trunc(sysdate);
+
+ if FlagUpdateNewBS=0 then 
+        vDateBeg:=to_date('01.01.2014','dd.mm.yyyy');
+  else      
+        vDateBeg:=DateBeg;
+  end if;
+ 
+ UpdTime_LOG (N,'InsertNewAcc','Уточнение кода и статьи обеспечения по типу клиента договора КредМод');
+      merge into  Lib_Acc_Bs_Period z      
+      using (
+            -- отбираем кредитные договоры в которых обеспечение привязано к договору либо к физикам, либо к юрикам
+             SELECT distinct a.id_acc, bs.id_cod_bs,bs.id_segment,bs.znak,bs.dacrdate,bs.datenext       
+             FROM  Lib_Acc_Bs a, lib_bs bs 
+             where substr(a.caccacc,1,5)=bs.acc_2 and a.flag_new_account=FlagUpdateNewBS 
+               and bs.dacrdate<=DateBeg_Year   and  bs.Datenext>DateBeg_Year                         
+               and exists (SELECT rt.caccacc
+                           FROM
+                                 (SELECT distinct cz.CCZOSCHET caccacc , (case when cu.ccusflag=1 then 1 else 2 end)  ccusflag_CredDog
+                                  FROM XXI."czo" cz,xxi."cda" cd, xxi."cus" cu 
+                                  where (cd.DCDASTARTED>=vDateBeg or (cd.DCDACLOSED>=vDateBeg or cd.DCDACLOSED is NULL) ) and
+                                        cd.NCDAAGRID=cz.NCZOAGRID and cu.icusnum=cd.ICDACLIENT                                                
+                                    and cz.CCZOSCHET in (select distinct g.CCZOSCHET
+                                                        from
+                                                            ( SELECT  distinct cz.CCZOSCHET, (case when cu.ccusflag=1 then 1 else 2 end) ccusflag  
+                                                              FROM  XXI."czo" cz,xxi."cda" ca, xxi."cus" cu
+                                                              where ca.NCDAAGRID=cz.NCZOAGRID and cu.icusnum=ca.ICDACLIENT) g
+                                                        group by g.CCZOSCHET
+                                                        having count(*)=1))  rt                                                       
+                          where rt.ccusflag_CredDog=bs.ccusflag and a.caccacc=rt.caccacc)                         
+                        
+              union
+              
+              -- отбираем кредитные договоры в которых обеспечение привязано к договору и к физикам,и к юрикам. Ассоцируем его с юриком 
+              SELECT distinct a.id_acc, bs.id_cod_bs,bs.id_segment,bs.znak,bs.dacrdate,bs.datenext       
+               FROM  Lib_Acc_Bs a, lib_bs bs 
+               where substr(a.caccacc,1,5)=bs.acc_2 and a.flag_new_account=FlagUpdateNewBS 
+                 and bs.dacrdate<=DateBeg_Year   and  bs.Datenext>DateBeg_Year                           
+                 and exists (SELECT rt.caccacc
+                             FROM
+                                   (SELECT distinct cz.CCZOSCHET caccacc , (case when cu.ccusflag=1 then 1 else 2 end)  ccusflag_CredDog
+                                    FROM XXI."czo" cz,xxi."cda" cd, xxi."cus" cu 
+                                    where cd.NCDAAGRID=cz.NCZOAGRID and cu.icusnum=cd.ICDACLIENT                                                
+                                      and cz.CCZOSCHET in (select distinct g.CCZOSCHET
+                                                          from
+                                                              ( SELECT  distinct cz.CCZOSCHET, (case when cu.ccusflag=1 then 1 else 2 end) ccusflag  
+                                                                FROM  XXI."czo" cz,xxi."cda" ca, xxi."cus" cu
+                                                                where ca.NCDAAGRID=cz.NCZOAGRID and cu.icusnum=ca.ICDACLIENT ) g
+                                                          group by g.CCZOSCHET
+                                                          having count(*)>1))  rt                                                       
+                            where 2=bs.ccusflag and a.caccacc=rt.caccacc                          
+                            )
+            ) d
+      on (z.id_acc=d.id_acc and z.dacrdate=d.dacrdate)
+      
+      when matched then
+         update set z.id_cod_bs =d.id_cod_bs,
+                    z.id_segment=d.id_segment,
+                    z.znak=d.znak,
+                    z.procedureupdate='Уточнение кода и статьи обеспечения по типу клиента договора КредМод',                   
+                    z.datenext=d.datenext,
+                    z.dateupdate=vDateUpdate
+      when not matched then 
+          insert (id_acc, id_cod_bs,id_segment,znak,dacrdate,datenext,procedureupdate,dateupdate)                        
+          values (d.id_acc, d.id_cod_bs,d.id_segment,d.znak,d.dacrdate,d.datenext,'Уточнение кода и статьи обеспечения по типу клиента договора КредМод',vDateUpdate);
+    
+      
+         commit;
+      UpdTime_LOG (N,'','',0);
+End Update_Lib_Acc_Bs_Period_CZO;
+
+----------------------------------------------------------------------------------------------------------------------------------------
+-- LIB_ANALITCORRECT_COD_BS уточнение кода BS с помощью таблицы правил
+procedure Update_LIB_acc_bs_LACCBS (DateBeg in Date,FlagUpdateNewBS in number) is
+     -- LIB_ANALITCORRECT_COD_BS уточнение кода BS с помощью таблицы правил
+ 
+N number;
+
+
+ begin
+ 
+ UpdTime_LOG (N,'InsertNewAcc','Аналитическое уточнение lib_analitcorrect_cod_bs');
+  
+merge into  LIB_ACC_BS_PERIOD  f
+using ( SELECT distinct t.id_acc,                       
+                  c.id_cod_bs_old,   
+                  c.id_segment_old,
+                  c.id_cod_bs_new,
+                  c.id_segment_new                              
+        FROM LIB_ACC_BS t,LIB_ACC_BS_PERIOD z,V_LIBANALITCORRECTION_BS  c
+         where t.caccacc like c.AccA  and c.ICDACCTYPE is NULL and c.id_segment_old is null
+               and t.id_acc=z.id_acc and z.id_cod_bs=c.id_cod_bs_old  ) d
+  on (d.id_acc=f.id_acc )
+  when matched then 
+      update set  f.ID_COD_BS=(case when d.ID_COD_BS_new is null then f.ID_COD_BS else d.ID_COD_BS_new end ),
+                  f.id_segment  =(case when d.id_segment_new is null then f.id_segment else d.id_segment_new end ),
+                  f.procedureupdate='0.Аналитическое уточнение lib_analitcorrect_cod_bs',  
+                  f.DATEUPDATE=trunc(sysdate);
+
+merge into  LIB_ACC_BS_PERIOD  f
+using ( SELECT distinct t.id_acc,                       
+                  c.id_cod_bs_old,   
+                  c.id_segment_old,
+                  c.id_cod_bs_new,
+                  c.id_segment_new                              
+        FROM LIB_ACC_BS t,LIB_ACC_BS_PERIOD z,V_LIBANALITCORRECTION_BS  c
+         where t.caccacc like c.AccA  and c.ICDACCTYPE is NULL and c.id_segment_old is not null
+               and t.id_acc=z.id_acc and z.id_cod_bs=c.id_cod_bs_old  and z.id_segment=c.id_segment_old  ) d
+  on (d.id_acc=f.id_acc)
+  when matched then 
+      update set  f.ID_COD_BS=(case when d.ID_COD_BS_new is null then f.ID_COD_BS else d.ID_COD_BS_new end ),
+                  f.id_segment  =(case when d.id_segment_new is null then f.id_segment else d.id_segment_new end ),
+                  f.procedureupdate='1.Аналитическое уточнение lib_analitcorrect_cod_bs', 
+                  f.DATEUPDATE=trunc(sysdate);
+ 
+
+     
+merge into (SELECT * FROM  LIB_ACC_BS_PERIOD z where z.dacrdate<=trunc(DateBeg,'yyyy') and z.datenext>trunc(DateBeg,'yyyy')) f
+using ( SELECT distinct t.id_acc,                        
+                  c.id_cod_bs_old,   
+                  c.id_segment_old,
+                  c.id_cod_bs_new,
+                  c.id_segment_new         
+        FROM LIB_ACC_BS t,LIB_ACC_BS_PERIOD z,V_LIBANALITCORRECTION_BS c ,lib_acc_type v
+         where t.caccacc like c.AccA and t.flag_new_account=FlagUpdateNewBS and v.modul_acctype=c.modul_acctype
+             and v.id_acc=t.id_acc and c.ICDACCTYPE=v.icdacctype and c.ICDACCTYPE is not null and c.id_segment_old is null 
+             and t.id_acc=z.id_acc and z.id_cod_bs=c.id_cod_bs_old  ) d
+  on (d.id_acc=f.id_acc )
+  when matched then 
+      update set  f.ID_COD_BS=(case when d.ID_COD_BS_new is null then f.ID_COD_BS else d.ID_COD_BS_new end ),
+                  f.id_segment  =(case when d.id_segment_new is null then f.id_segment else d.id_segment_new end ),                 
+                  f.procedureupdate='2.Аналитическое уточнение lib_analitcorrect_cod_bs',
+                  f.DATEUPDATE=trunc(sysdate);   
+    commit;  
+    
+    
+merge into (SELECT * FROM  LIB_ACC_BS_PERIOD z where z.dacrdate<=trunc(DateBeg,'yyyy') and z.datenext>trunc(DateBeg,'yyyy')) f
+using ( SELECT distinct t.id_acc,                        
+                  c.id_cod_bs_old,   
+                  c.id_segment_old,
+                  c.id_cod_bs_new,
+                  c.id_segment_new         
+        FROM LIB_ACC_BS t,LIB_ACC_BS_PERIOD z,V_LIBANALITCORRECTION_BS c,lib_acc_type v
+         where t.caccacc like c.AccA and t.flag_new_account=FlagUpdateNewBS and v.modul_acctype=c.modul_acctype
+             and v.id_acc=t.id_acc and c.ICDACCTYPE=v.icdacctype and c.ICDACCTYPE is not null and c.id_segment_old is not null 
+             and t.id_acc=z.id_acc and z.id_cod_bs=c.id_cod_bs_old  and z.id_segment=c.id_segment_old ) d
+  on (d.id_acc=f.id_acc )
+  when matched then 
+      update set  f.ID_COD_BS=(case when d.ID_COD_BS_new is null then f.ID_COD_BS else d.ID_COD_BS_new end ),
+                  f.id_segment  =(case when d.id_segment_new is null then f.id_segment else d.id_segment_new end ),                 
+                  f.procedureupdate='3.Аналитическое уточнение lib_analitcorrect_cod_bs',
+                  f.DATEUPDATE=trunc(sysdate);   
+    commit; 
+    
+        
+    
+     
+       
+  UpdTime_LOG (N,'','',0);
+  
+
+End Update_LIB_acc_bs_LACCBS;
+
+
+
+
+-----------------------------------------------------------------------------------------------------------------
+
+-- обновляем в BS_OST и в BS_ACC_AGR коды стетй, сегментов при изменении оных в случае изменения клиента и типа клиента по счету
+procedure UPDATE_COD_BS_SEGMENT_BS_OST is
+ begin
+   
+UpdTime_LOG (N,'InsertNewAcc','Уточнение статей и сегментов в BS при изменении клиента и типа клиента по счету');
+ -- обновляем статьи и сегмент в таблицах остатки за прошлые периоды если произошла перепривязка счета к другому клиенту
+       merge into bs_ost t
+        using (SELECT p.ID_ACC, p.ID_COD_BS, p.ID_SEGMENT, p.ZNAK,  p.DACRDATE, p.DATENEXT, 
+                      p.ID_COD_BS as ID_COD_BS_NEW, p.ID_SEGMENT as ID_SEGMENT_NEW 
+               FROM LIB_ACC_BS_PERIOD p
+               Where p.id_acc in (SELECT b.id_acc FROM LIB_ACC_BS b where b.flag_new_account=1) 
+               )z
+          on (   z.id_acc=t.id_acc 
+                 and (t.ID_COD_BS!=z.ID_COD_BS or t.ID_SEGMENT!=z.ID_SEGMENT) 
+                 and t.dacrdate<z.datenext 
+                 and t.datenext>z.dacrdate) 
+       when matched then 
+        update set t.id_segment=z.ID_SEGMENT_NEW,
+                   t.znak=z.ZNAK,
+                   t.id_cod_bs= z.ID_COD_BS_NEW;   
+       commit;
+       
+     
+    begin  
+         -- обновляем статьи и сегмент в таблицах остатки за прошлые периоды если произошла перепривязка счета к другому клиенту   
+           merge into bs_acc_agr t
+            using (SELECT p.ID_ACC, p.ID_COD_BS, p.ID_SEGMENT, p.ZNAK,  p.DACRDATE, p.DATENEXT, 
+                          p.ID_COD_BS as ID_COD_BS_NEW, p.ID_SEGMENT as ID_SEGMENT_NEW 
+                   FROM LIB_ACC_BS_PERIOD p
+                   Where p.id_acc in (SELECT b.id_acc FROM LIB_ACC_BS b where b.flag_new_account=1) 
+                   )z
+              on (   z.id_acc=t.id_acc 
+                     and (t.ID_COD_BS!=z.ID_COD_BS or t.ID_SEGMENT!=z.ID_SEGMENT) 
+                     and (t.date_period-1) between z.dacrdate and z.datenext 
+                    ) 
+           when matched then 
+            update set t.id_cod_bs= z.ID_COD_BS_NEW,
+                       t.id_segment=z.ID_SEGMENT_NEW,
+                       t.balance_val= abs(t.balance_val) * z.ZNAK,
+                       t.balance_rub= abs(t.balance_rub) * z.ZNAK,
+                       t.balance_avr_val= abs(t.balance_avr_val) * z.ZNAK,
+                       t.balance_avr_rub= abs(t.balance_avr_rub) * z.ZNAK
+                         ;
+           commit; 
+           
+           exception
+             when DUP_VAL_ON_INDEX
+              then 
+               -- null;
+                 commit; 
+                 delete from bs_acc_agr t where t.balance_val=0 and t.balance_rub=0 and t.balance_avr_val=0 and t.balance_avr_rub=0; 
+                 commit; 
+                 UPDATE_COD_BS_SEGMENT_BS_OST;
+                 
+    end ;   
+       
+  UpdTime_LOG (N,'','',0);                       
+                   
+End UPDATE_COD_BS_SEGMENT_BS_OST;                   
+                   
+------------------------------------------------------------------------------------------------------------
+
+-- исправление статьи по кредитам физикам при изменении в кредитном модуле  типа кредита
+-- Процедура используется по утрам
+procedure Update_LIB_acc_bs_Mistake(DateBeg in Date) is
+  
+N number;
+id_DateBegYear number;
+DateBegYear date;
+Flag  number;
+DataFound number;
+ -- курсор для уточнения статьи по типу клиента  
+ cursor ClientCur (v_Metka  lib_podmen_cod_bs.metka%type) is
+        SELECT t.id_cod_bs_old,t.id_cod_bs_new FROM lib_podmen_cod_bs t WHERE t.metka=v_Metka; 
+
+
+ begin
+    -- начало года
+    DateBegYear:=trunc(DateBeg,'yyyy');
+    select d.id_date into id_DateBegYear from tbldate d where d.cntdate=trunc(DateBeg,'yyyy');   
+     Flag:=0;    
+             
+      UpdTime_LOG (N,'Update_LIB_acc_bs_Mistake','Исправление статьи на потребы при смене типа кредита');  
+     
+     
+      -- выявляем ошибки по кредитным картам   
+      select count(*) into DataFound 
+                              FROM XXI.CBACC t,xxi."cda" ct, LIB_ACC_BS a,lib_acc_bs_period ap 
+                              where ap.id_acc=a.id_acc 
+                                and ap.id_cod_bs in (SELECT t.id_cod_bs_old FROM lib_podmen_cod_bs t WHERE t.metka='Ошибки Карта') 
+                                and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear
+                                 and t.cdacc=a.CACCACC
+                                 and t.cdagrid=ct.NCDAAGRID
+                                 and ct.DCDASIGNDATE<trunc(sysdate,'dd')
+                                 and a.id_acc=ap.id_acc 
+                                 and exists (SELECT c.icauid,c.ccusflag 
+                                            FROM LIB_CREDITGROUPDOG c 
+                                            where c.icauid=ct.ICDAPURPOSE 
+                                               and c.ccusflag= a.ccusflag
+                                               and CREDITGROUPNAME!='Кредитная карта');
+  
+      if DataFound>0 then 
+        Flag:=1;
+         FOR ref_Cur in ClientCur ('Ошибки Карта') 
+          loop  
+            -- проверяем наличие неверных кодов статей по кредитам 
+                 
+                 update lib_acc_bs_period ap 
+                              set ap.id_cod_bs=ref_Cur.id_cod_bs_new, 
+                                  ap.procedureupdate='Первичная кодировка BS', 
+                                  ap.dateupdate=trunc(sysdate)
+                               where ap.id_cod_bs=ref_Cur.id_cod_bs_old 
+                                 and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear
+                                 and exists(select  a.id_acc
+                                            FROM XXI.CBACC t,xxi."cda" ct, LIB_ACC_BS a
+                                            where t.cdacc=a.CACCACC
+                                               and t.cdagrid=ct.NCDAAGRID
+                                               and ct.DCDASIGNDATE<trunc(sysdate,'dd')
+                                               and a.id_acc=ap.id_acc 
+                                               and exists (SELECT c.icauid,c.ccusflag 
+                                                          FROM LIB_CREDITGROUPDOG c 
+                                                          where c.icauid=ct.ICDAPURPOSE 
+                                                             and c.ccusflag= a.ccusflag
+                                                             and CREDITGROUPNAME!='Кредитная карта')                                     
+                                              ) ;
+                                            
+                commit;                                 
+          end loop;
+      end if;     
+            
+            
+    -- выявляем ошибки по ипотеке 
+        select count(*) into DataFound 
+                              FROM XXI.CBACC t,xxi."cda" ct, LIB_ACC_BS a,lib_acc_bs_period ap 
+                              where ap.id_acc=a.id_acc 
+                                and ap.id_cod_bs in (SELECT t.id_cod_bs_old FROM lib_podmen_cod_bs t WHERE t.metka='Ошибки Ипотека')  
+                                and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear
+                                 and t.cdacc=a.CACCACC
+                                 and t.cdagrid=ct.NCDAAGRID
+                                 and ct.DCDASIGNDATE<trunc(sysdate,'dd')
+                                 and a.id_acc=ap.id_acc 
+                                 and exists (SELECT c.icauid,c.ccusflag 
+                                            FROM LIB_CREDITGROUPDOG c 
+                                            where c.icauid=ct.ICDAPURPOSE 
+                                               and c.ccusflag= a.ccusflag
+                                               and CREDITGROUPNAME!='Ипотечный кредит');
+    
+    
+      if DataFound>0 then
+        Flag:=1;    
+        FOR ref_Cur in ClientCur ('Ошибки Ипотека') 
+          loop                
+                 update lib_acc_bs_period ap 
+                              set ap.id_cod_bs=ref_Cur.id_cod_bs_new, 
+                                  ap.procedureupdate='Первичная кодировка BS',
+                                  ap.dateupdate=trunc(sysdate) 
+                               where ap.id_cod_bs=ref_Cur.id_cod_bs_old 
+                                 and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear
+                                 and exists(select  a.id_acc
+                                            FROM XXI.CBACC t,xxi."cda" ct, LIB_ACC_BS a
+                                            where t.cdacc=a.CACCACC
+                                               and t.cdagrid=ct.NCDAAGRID
+                                               and ct.DCDASIGNDATE<trunc(sysdate,'dd')
+                                               and a.id_acc=ap.id_acc 
+                                               and exists (SELECT c.icauid,c.ccusflag 
+                                                          FROM LIB_CREDITGROUPDOG c 
+                                                          where c.icauid=ct.ICDAPURPOSE 
+                                                             and c.ccusflag= a.ccusflag
+                                                             and CREDITGROUPNAME!='Ипотечный кредит'));
+                commit;                                 
+            end loop;   
+          end if;   
+            
+            
+         if Flag=1 then
+             pl_create.Update_LIB_TRN_PL (DateBeg,'446-П',0);
+         end if;     
+                                      
+      UpdTime_LOG (N,'','',0);                                  
+end Update_LIB_acc_bs_Mistake;
+
+
+
+
+-------------------------------------------------------------------------------------------------------------------
+--Уточнение статьи счетов по ипотечным кредитам.Уточнение ведем по названию счета
+procedure Update_LIB_acc_bs_Ipoteka (DateBeg in Date, FlagUpdateNewBS in number) is
+  --Уточнение статьи счетов по ипотечным кредитам.Уточнение ведем по названию счета
+   -- уточнение статьи  РВП и РВПС по счетам ПОС  для ипотеки 
+  
+N number;
+
+DateBegYear date;
+ -- курсор для уточнения статьи по типу клиента  
+ cursor ClientCur (v_Metka  lib_podmen_cod_bs.metka%type) is
+        SELECT t.id_cod_bs_old,t.id_cod_bs_new FROM lib_podmen_cod_bs t WHERE t.metka=v_Metka; 
+
+
+ begin
+    -- начало года
+    DateBegYear:=trunc(DateBeg,'yyyy'); 
+     
+        
+             --Уточнение статьи по типу клиента для забалансовых счетов физиков
+      UpdTime_LOG (N,'InsertNewAcc','Уточнение статьи счетов по ипотечным кредитам');  
+      
+     -- формируем список ипотечных счетов в таблице  DJ_TEMP
+     execute immediate 'truncate table DJ_TEMP';     
+     if DateBeg>=to_date('01.01.2018','dd.mm.yyyy') or FlagUpdateNewBS=0 then 
+         insert into DJ_TEMP (Id_Acc,IQDGIDENT)
+         select   t.id_acc, t.NCDHAGRID
+                               FROM V_CREDITDOGOVOR t,LIB_CREDITGROUPDOG c 
+                               where   c.icauid=t.ICDAPURPOSE and CREDITGROUPNAME='Ипотечный кредит';
+          commit;                         
+     else
+         insert into DJ_TEMP (Id_Acc)                          
+         SELECT r.id_acc 
+                            FROM LIB_ACC_BS r,XXI.acc ac
+                            where r.flag_new_account=FlagUpdateNewBS 
+                             and  r.ccusflag in (1,5) 
+                             and (r.CACCACC=ac.caccacc) and 
+                                               ( instr(lower(ac.CACCNAME),'и/к')>0 
+                                                         or instr(lower(ac.CACCNAME),'ипотеч')>0 
+                                                                   or instr(lower(ac.CACCNAME), '08-1-0001 икр от 20.08.2008')>0);     
+    end if;
+   
+   
+   FOR ref_Cur in ClientCur ('Ипотека') 
+          loop 
+          -- уточнение индивидуальных кредитов
+          update lib_acc_bs_period ap 
+          set ap.id_cod_bs=ref_Cur.id_cod_bs_new, 
+                             ap.procedureupdate='3.Аналитическое уточнение lib_podmen_cod_bs', 
+                             ap.dateupdate=trunc(sysdate)
+                       where ap.id_cod_bs =ref_Cur.id_cod_bs_old 
+                         and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear
+                         and ap.id_acc  in (SELECT r.id_acc FROM DJ_TEMP r);
+             commit;    
+           
+          -- уточняем статьи по для всех счетов входящих ПОС
+           if DateBeg>=to_date('01.01.2018','dd.mm.yyyy') or FlagUpdateNewBS=0 then
+             update lib_acc_bs_period ap 
+                           set ap.id_cod_bs=ref_Cur.id_cod_bs_new, 
+                               ap.procedureupdate='3.Аналитическое уточнение lib_podmen_cod_bs по ПОС'  
+                         where ap.id_cod_bs=ref_Cur.id_cod_bs_old 
+                           and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear                         
+                           and exists(select distinct    b.id_acc 
+                                      From  XXI."cdpt_acc" ac, XXI."cdpt" t, XXI.cdh h, XXI."cda" a, lib_acc_bs b
+                                       Where  ac.NCDPTACCID=t.ICDPTID                
+                                          and t.icdptid=h.icdhival  AND h.ccdhterm = 'PRTF'
+                                          and h.dcdhdate>DateBeg 
+                                       -- AND h.icdhdsub = 0 --индекс на дату, если значений несколько на одну дату
+                                          and h.ncdhagrid=a.NCDAAGRID  
+                                          and a.ICDAPURPOSE in (SELECT e.icauid 
+                                                                FROM LIB_CREDITGROUPDOG e 
+                                                                where e.creditgroupname='Ипотечный кредит')
+                                          and ac.CCDPTACCACC =b.caccacc
+                                          and b.id_acc=ap.id_acc
+                                                             ) ;
+              commit;
+           end if;         
+          
+          
+          end loop;      
+       commit;  
+      UpdTime_LOG (N,'','',0);      
+      
+      
+      
+end Update_LIB_acc_bs_Ipoteka;
+
+
+
+-------------------------------------------------------------------------------------------------------------------
+--Уточнение статьи счетов по кредитным кредитам.
+procedure Update_LIB_acc_bs_CreditCard (DateBeg in Date, FlagUpdateNewBS in number) is
+  --Уточнение статьи счетов по кредитным кредитам.
+ 
+  
+N number;
+id_DateBegYear number;
+DateBegYear date;
+ -- курсор для уточнения статьи по типу клиента  
+ cursor ClientCur (v_Metka  lib_podmen_cod_bs.metka%type) is
+        SELECT t.id_cod_bs_old,t.id_cod_bs_new FROM lib_podmen_cod_bs t WHERE t.metka=v_Metka; 
+
+
+ begin
+    -- начало года
+    DateBegYear:=trunc(DateBeg,'yyyy');
+     select d.id_date into id_DateBegYear from tbldate d where d.cntdate=trunc(DateBeg,'yyyy');
+     
+        
+             --Уточнение статьи по типу клиента для забалансовых счетов физиков
+      UpdTime_LOG (N,'InsertNewAcc','Уточнение статьи счетов по кредитным картам');  
+      
+      -- begin 
+        FOR ref_Cur in ClientCur ('Кредитная карта') 
+          loop          
+            -- с 01.01.2018 кредитные договоры мигрировали в XXI
+              update lib_acc_bs_period ap 
+                 set ap.id_cod_bs=ref_Cur.id_cod_bs_new, 
+                     ap.procedureupdate='4.Аналитическое уточнение lib_podmen_cod_bs',
+                     ap.dateupdate=trunc(sysdate) 
+               where ap.id_cod_bs=ref_Cur.id_cod_bs_old 
+                 and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear
+                 and exists(SELECT 1 --'Кредитные карты' - Не учитывает РВПС по ПОС для карт
+                            FROM  LIB_ACC_BS a, XXI.CBACC t,XXI.PL_PLA_CD p
+                            where a.CACCACC=t.cdacc
+                              and t.cdagrid=p.ncdaagrid                                      
+                              and a.flag_new_account=FlagUpdateNewBS                                       
+                              and ap.id_acc=a.id_acc 
+                           ) 
+                             ;
+                  commit;                                     
+                -- уточняем статьи по для всех счетов входящих ПОС
+               if DateBeg>=to_date('01.01.2018','dd.mm.yyyy') or FlagUpdateNewBS=0 then
+                 update lib_acc_bs_period ap 
+                               set ap.id_cod_bs=ref_Cur.id_cod_bs_new, 
+                                   ap.procedureupdate='4.Аналитическое уточнение lib_podmen_cod_bs по ПОС',
+                                   ap.dateupdate=trunc(sysdate)  
+                             where ap.id_cod_bs=ref_Cur.id_cod_bs_old 
+                               and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear                         
+                               and exists(select distinct    b.id_acc 
+                                          From  XXI.cdpt_acc ac, XXI.cdpt t, XXI.cdh h, XXI.cda a, lib_acc_bs b
+                                           Where  ac.NCDPTACCID=t.ICDPTID                
+                                              and t.icdptid=h.icdhival  AND h.ccdhterm = 'PRTF' 
+                                           -- AND h.icdhdsub = 0 --индекс на дату, если значений несколько на одну дату
+                                              and h.ncdhagrid=a.NCDAAGRID  
+                                              and a.ICDAPURPOSE in (SELECT e.icauid 
+                                                                    FROM LIB_CREDITGROUPDOG e 
+                                                                    where e.creditgroupname='Кредитная карта')
+                                              and ac.CCDPTACCACC =b.caccacc
+                                              and b.id_acc=ap.id_acc
+                                                                 ) ;
+              commit;
+           end if;                            
+                                     
+                                     
+                                     
+                                     
+          end loop;      
+       commit;  
+      UpdTime_LOG (N,'','',0);      
+      
+      
+      
+end Update_LIB_acc_bs_CreditCard;
+
+
+----------------------------------------------------------------------------------------------------------------------
+--уточнение кода денежных средств на банкоматы и устройства самообслуживания
+procedure Update_LIB_acc_bs_Bankomat (DateBeg in Date, FlagUpdateNewBS in number) is
+    
+N number;
+id_DateBegYear number;
+DateBegYear date;
+ -- курсор для уточнения статьи по типу клиента  
+ cursor ClientCur (v_Metka  lib_podmen_cod_bs.metka%type) is
+        SELECT t.id_cod_bs_old,t.id_cod_bs_new FROM lib_podmen_cod_bs t WHERE t.metka=v_Metka; 
+
+
+ begin
+    -- начало года
+    DateBegYear:=trunc(DateBeg,'yyyy');
+     select d.id_date into id_DateBegYear from tbldate d where d.cntdate=trunc(DateBeg,'yyyy');
+     
+        
+             --Уточнение статьи по типу клиента для забалансовых счетов физиков
+      UpdTime_LOG (N,'InsertNewAcc','Уточнение статьи счетов по Устройствам самообслуживания');  
+      
+   
+        FOR ref_Cur in ClientCur ('Устройства самообслуживания') 
+          loop           
+              update lib_acc_bs_period ap 
+                         set ap.id_cod_bs=ref_Cur.id_cod_bs_new, 
+                             ap.procedureupdate='5.Аналитическое уточнение lib_podmen_cod_bs',
+                             ap.dateupdate=trunc(sysdate) 
+                       where ap.id_cod_bs=ref_Cur.id_cod_bs_old 
+                         and ap.dacrdate<=DateBegYear and ap.datenext>DateBegYear
+                         and exists(select  a.id_acc
+                                    FROM  LIB_ACC_BS a,
+                                          (select a.cplatmacc caccacc, 
+                                                  decode(p.IPLATMTYPE,1,'Банкомат',2,'ПВН',3,'ТСП',4,'Устройства самообслуживания') DeviceType  
+                                            FROM XXI.PL_ATM_ACC a,pl_atm p where a.iplatmid=p.IPLATMID and p.IPLATMTYPE =4) l
+                                    
+                                    where a.flag_new_account=FlagUpdateNewBS
+                                       and a.caccacc=l.caccacc
+                                       and a.id_acc=ap.id_acc 
+                                       and DeviceType='Устройства самообслуживания');
+                                                                                    
+         end loop;      
+       commit;  
+      UpdTime_LOG (N,'','',0);      
+      
+      
+end Update_LIB_acc_bs_Bankomat;                                                 
+
+
+-----------------------------------------------------------------------------------------------------------------------
+  -- загрузка балансовых остатков из XXI за любой период времени в BS_TEMP
+procedure INSERT_BalXXI_BS_TEMP (DateBeg in Date, DateEnd in date, cIDSMR in xxi.acc.IDSMR%type,FlagLoadBegSaldo in number DEFAULT 0) is
+      -- загрузка балансовых остатков из XXI за любой период времени в BS_TEMP
+			-- берем счета с оборотами по вчерашний день включительно     
+n number;
+cntSysDate date;
+vDateEnd date;
+ 
+begin
+	
+vDateEnd :=DateEnd;-- берем счета с оборотами по вчерашний день включительно
+idsmr_switch(cIDSMR);
+
+cntSysDate:=trunc(sysdate);
+
+ 
+  UpdTime_LOG (N,'INSERT_BalXXI_BS_TEMP','Загрузка остатков из XXI в bs_temp');
+  if FlagLoadBegSaldo=1 THEN
+     insert /*+ APPEND */ into bs_temp (id_acc,iacccus,ccusflag,TYPEACC,caccacc,cacccur,idsmr,balance_val,balance_rub,dacrdate,datenext,dacrdate_acr )
+     select f.id_acc,
+            ac.iacccus,
+            f.ccusflag,
+            ac.CACCAP,
+            a.CACRACC , a.CACRCUR,a.IDSMR,
+                      
+              (case when a.CACRCUR='RUR' 
+                then 0 
+                 else (case when ac.CACCAP='П' then 1 else -1 end)*(nvl(a.MACRCREDOB,0)-nvl(a.MACRDEBOB,0))
+                  end) as Balanse_Val,
+               
+               
+                (case  when ac.CACCAP='П' then 1 else -1 end) * (nvl(a.MACRCREDOB_RUB,0)-nvl(a.MACRDEBOB_RUB,0)) as Balanse_Rub,            
+            
+     
+             a.DACRDATE,             
+             
+             
+             (case
+              when  (SELECT min(g.DACRDATE)  FROM xxi.acr g 
+                                            where g.DACRDATE>a.DACRDATE and g.DACRDATE<=cntSysDate
+                                              and a.CACRACC=g.CACRACC                                   
+                                              and a.CACRCUR=g.CACRCUR) is null 
+                     then  to_date('01.01.3000','dd.mm.yyyy')
+              else         
+              (SELECT min(g.DACRDATE)  FROM xxi.acr g 
+                                                       where g.DACRDATE>a.DACRDATE and g.DACRDATE<=cntSysDate
+                                                           and a.CACRACC=g.CACRACC                                             
+                                                           and a.CACRCUR=g.CACRCUR)  
+              end )  as datenext,
+              
+              a.DACRDATE as dacrdate_acr
+     
+     
+     from xxi.acc ac,xxi.acr a LEFT JOIN  lib_acc_bs f
+       on  f.caccacc=a.CACRACC and f.cacccur=f.cacccur
+     where ac.CACCACC=a.CACRACC 
+       and  substr(a.CACRACC,1,1) not in ('8')        
+       AND  substr(a.CACRACC,1,4) not in ('1000','9999')
+      and a.DACRDATE<DateBeg  and  
+           (                                                                            --
+           (SELECT min(g.DACRDATE)  FROM xxi.acr g
+                                    where g.DACRDATE between a.DACRDATE+1 and DateBeg-1 
+                                           and  a.CACRACC =g.CACRACC                                    
+                                           and a.CACRCUR=g.CACRCUR
+                                           )  is null   
+           );                                                                 
+                 
+   else  
+     
+     insert /*+ APPEND */ into bs_temp (id_acc,iacccus,ccusflag,TYPEACC,caccacc,cacccur,idsmr,balance_val,balance_rub,
+                                        dacrdate,datenext,dacrdate_acr )
+     
+     select f.id_acc,
+            ac.iacccus,
+            f.ccusflag,
+            ac.CACCAP,
+            a.CACRACC , a.CACRCUR,a.IDSMR,                      
+              (case when a.CACRCUR='RUR' 
+                then 0 
+                 else (case when ac.CACCAP='П' then 1 else -1 end)*(nvl(a.MACRCREDOB,0)-nvl(a.MACRDEBOB,0))
+               end) as Balanse_Val,
+               
+               
+                (case  when ac.CACCAP='П' then 1 else -1 end) * (nvl(a.MACRCREDOB_RUB,0)-nvl(a.MACRDEBOB_RUB,0)) as Balanse_Rub,            
+            
+     
+             a.DACRDATE,             
+             
+             
+             (case
+              when  (SELECT min(g.DACRDATE)  FROM xxi.acr g 
+                                            where g.DACRDATE>a.DACRDATE and g.DACRDATE<=SysDate
+                                              and a.CACRACC=g.CACRACC                                   
+                                              and a.CACRCUR=g.CACRCUR) is null 
+                     then  to_date('01.01.3000','dd.mm.yyyy')
+              else         
+              (SELECT min(g.DACRDATE)  FROM xxi.acr g 
+                                                       where g.DACRDATE>a.DACRDATE and g.DACRDATE<=SysDate
+                                                           and a.CACRACC=g.CACRACC                                             
+                                                           and a.CACRCUR=g.CACRCUR)  
+              end )  as datenext,
+              
+              a.DACRDATE as dacrdate_acr
+              
+     
+     
+     from xxi.acc ac,xxi.acr a LEFT JOIN  lib_acc_bs f
+       on  f.caccacc=a.CACRACC and f.cacccur=f.cacccur
+     where ac.CACCACC=a.CACRACC 
+       and  substr(a.CACRACC,1,1) not in ('8')        
+       AND  substr(a.CACRACC,1,4) not in ('1000','9999')    
+       and  a.DACRDATE between DateBeg and vDateEnd 
+			 and (a.MACRCREDOB_RUB!=0 or a.MACRDEBOB_RUB!=0);
+   end if;  
+  commit; 
+  
+  
+-- уточняем тип клиента по новым счетам 
+  update bs_temp t 
+   set t.ccusflag=(SELECT to_char(cu.ccusflag) FROM XXI."cus" cu where cu.icusnum=t.iacccus)                        
+  where t.id_acc is null;
+  commit;
+     
+      
+UpdTime_LOG (N,'','',0);
+end INSERT_BalXXI_BS_TEMP;
+
+
+-------------------------------------------------------------------------------------------------------------------
+-- добавление новых счетов из bs_temp в LIB_ACC_BS 
+procedure InsertNewAcc_To_LIB_ACC_BS  is
+-- добавление новых счетов из bs_temp в LIB_ACC_BS 
+
+n number;
+begin 
+  
+  UpdTime_LOG (N,'InsertNewAcc_To_LIB_ACC_BS','добавление новых счетов из bs_temp в LIB_ACC_BS');
+-- обновляем библиотеку новыми счетами    
+    insert /*+ APPEND */ into LIB_ACC_BS  ( Caccacc,CACCCUR,Ccusflag,Iacccus,Flag_New_Account,id_acc,TYPEACC,DATEUPDATE)        
+    SELECT y.Caccacc,y.CACCCUR,   y.ccusflag, y.Iacccus,1, id_acc.nextval , y.typeacc, y.dacrdate_acr 
+          
+    FROM (SELECT distinct d.Caccacc,d.CACCCUR,d.Iacccus,d.ccusflag, Trim(d.typeacc) as typeacc,
+                (SELECT min(g.dacrdate_acr)  
+                 FROM bs_temp g 
+                 where g.caccacc=d.caccacc 
+                   and g.id_acc is null) as dacrdate_acr    
+          FROM  bs_temp d where  d.id_acc is null) y
+                 ;
+    commit;
+    
+
+     
+
+   -- уточняем id_acc по новым счетам в bs_temp   
+     update bs_temp t 
+     set t.id_acc=(SELECT u.id_acc FROM LIB_ACC_BS u where u.caccacc=t.caccacc) 
+     where t.id_acc is null;
+  commit;
+    
+
+UpdTime_LOG (N,'','',0);
+end InsertNewAcc_To_LIB_ACC_BS;
+
+-------------------------------------------------------------------------------------------------------------------
+-- обновление привязки отделения к лицевому счету
+procedure Update_LIB_ACC_OTD_PERIOD is
+-- обновление привязки отделения к лицевому счету чувсвителен по idsmr
+
+n number;
+cntDate timestamp;
+id_dacrdate_New number;
+id_dacrdate_FirstTime number;
+dacrdate_New date;
+
+begin 
+
+  
+  UpdTime_LOG (N,'Update_LIB_ACC_OTD_PERIOD','добавление новых счетов из bs_temp в LIB_ACC_OTD_PERIOD');
+  
+-- добавляем новый  лицевой счет и привязку допофиса в LIB_ACC_OTD_PERIOD 
+     
+    cntDate:=sysdate;
+   
+    -- дата завершения действия привязки
+    dacrdate_New:=trunc(sysdate);
+    select d.id_date into id_dacrdate_New from tbldate d where d.cntdate=trunc(sysdate);
+  
+   --  дату начала для нового на счета. Всегда  '01.01.2014' для минимизации колличетсва интервалов!!!!
+    select d.id_date into id_dacrdate_FirstTime from tbldate d where d.cntdate=To_date('01.01.2014','dd.mm.yyyy');
+        
+    
+    -- вставляем новые счета в таблицу отделений, уточняем изменения
+   For cur in 
+      ( select g.id_ACC,g.id_otd_New,g.id_otd_old,g.CACCACC,g.CACCCUR  from
+         (
+         select  b.id_ACC,a.CACCACC,a.CACCCUR,
+                      (SELECT  (case when a.CACCACC not like '706______0200_______' 
+                                    then do.id_otd 
+                                      else 82 -- относим счета на Москву
+                                        end)                        
+                        FROM lib_otd do where  do.iotdnum=a.IACCOTD and do.IDSMR=a.IDSMR) id_otd_New, 
+                                             
+                        t.id_otd as id_otd_old
+                                      
+                   from XXI.acc a, (lib_acc_bs b left JOIN LIB_ACC_OTD_PERIOD t on  b.id_acc=t.id_acc)                 
+                   where  (t.id_acc is null or t.datenext=MaxDate)  and a.CACCACC=b.CACCACC and a.CACCCUR=b.CACCCUR) g
+          where  g.id_otd_old!=g.id_otd_New or g.id_otd_old is NULL )
+    loop
+       
+    
+     if cur.id_otd_old is  null then               
+          -- вставляем новые счета в привязке к отделению
+           insert into LIB_ACC_OTD_PERIOD (ID_ACC,ID_OTD,DACRDATE,DATENEXT, DATEUPDATE)
+           values (cur.id_acc,cur.id_otd_new,MinDate,MaxDate,cntDate );
+        commit;  
+     end if;  
+    
+    if cur.id_otd_old is not null then
+        -- счет           
+            -- закрытие привязки счета к отделению    
+            update LIB_ACC_OTD_PERIOD t set                           
+                              t.datenext=dacrdate_New,
+                              t.dateupdate=trunc(sysdate) 
+            where t.id_acc=cur.id_ACC and t.datenext=MaxDate;            
+            commit;
+                      
+            -- новая привязка счета к отделению           
+            insert into LIB_ACC_OTD_PERIOD (ID_ACC,ID_OTD,DACRDATE,DATENEXT, DATEUPDATE)
+            values (cur.id_acc,cur.id_otd_new, dacrdate_New,MaxDate,cntDate);
+            commit;    
+    end if;
+            
+       
+    
+    end loop;
+     
+    commit;
+    
+  
+UpdTime_LOG (N,'','',0);
+end Update_LIB_ACC_OTD_PERIOD;
+------------------------------------------------------------------------------------------------------------------------
+
+-- выявление новых лицевых счетов за период DateBeg и DateEnd. Загрузка из в библиотеки и их расскраска
+procedure InsertNewAcc(DateBeg in date,  FlagUpdateNewBS in number DEFAULT 1 ) is
+
+-- выявление новых лицевых счетов за период DateBeg и DateEnd. Загрузка из в библиотеки и их расскраска
+-- признак загрузки сальдо на начало периода FlagLoadBegSaldo - 1, 0
+-- FlagUpdateNewBS признак обновления лицевичков при изменнении кодов статей и лицвиков - 1, 0
+
+  -- Процедуры зависящие от IDSMR
+--DELETE_ACC_BAD
+--INSERT_ACC2_To_LIB_BS
+--Update_LIB_ACC_BS_cus
+--Update_LIB_acc_bs_Ipoteka
+--Update_LIB_ACC_OTD_PERIOD
+--UPDATE_LIB_ACC_TYPE - надо сделать обновление от idsmr!!!!!
+
+I number;
+  
+   
+BEGIN
+
+       For I in 1..3 
+        loop
+         if I!=2 then 
+             idsmr_switch(I);       
+                  -- удаляем счета, которы были внесены в базу XXI ошибочно
+                   bs_create.DELETE_ACC_BAD(I);  --acc                   
+                    -- обновляем  код клиента в LIB_acc_bs
+                   bs_create.Update_LIB_ACC_BS_cus ;             
+                    -- обновляем  тип клиента в LIB_acc_bs       
+                   bs_create.Update_LIB_acc_bs_ccusflag;                      
+                         
+                    -- выявляем новые счета 2 порядка и пишем их в LIB_BS   
+                     bs_create.INSERT_ACC2_To_LIB_BS;                     
+              end if;
+        end loop;
+         
+         -- добавление новых счетов из bs_temp в LIB_ACC_BS 
+        bs_create.InsertNewAcc_To_LIB_ACC_BS;
+
+        --Добавление новых счетов и Первичная расскраска статьями бюджета
+        bs_create.Update_Lib_Acc_Bs_Period_AtrBS(DateBeg,FlagUpdateNewBS);  
+        
+
+
+
+      -- обновление привязки отделения к лицевому счету
+      -- загрузка типов счетов
+
+      For I in 1..3 
+        loop
+           if I!=2 then  
+                idsmr_switch(I);             
+                         
+              --обновляем библиотеку Групп типов целей кредитных договоров для последующего уточнения статей по ипотеке
+                Update_LIB_CREDITGROUPDOG;  
+                
+              -- Уточнение  статьи и сегмента лицевого счета по типу клиента в ПОС кредитного модуля 
+                Update_Lib_Acc_Bs_Period_POS (DateBeg,FlagUpdateNewBS); 
+              
+              --Уточнение кода и статьи счетов Обеспечения/залога/поручительства по типу клиента в соответствующем договоре КредМод  
+                Update_Lib_Acc_Bs_Period_CZO (DateBeg,FlagUpdateNewBS);   
+               
+                -- обновление привязки отделения к лицевому счету  
+                bs_create.Update_LIB_ACC_OTD_PERIOD;         
+           
+               -- загрузка типов счетов         
+               bs_create.UPDATE_LIB_ACC_TYPE ; -- загрузка типов счетов                    
+                   
+           end if;         
+      end loop;
+
+  
+
+       
+       
+       --------------------------------------------------------------------------------------------------
+        
+        
+         -- LIB_ANALITCORRECT_COD_BS уточнение кода BS с помощью таблицы правил
+       bs_create.Update_LIB_acc_bs_LACCBS(DateBeg,FlagUpdateNewBS);
+       
+       --------------------------------------------------------------------------------------------- 
+       
+       --Уточнение статьи счетов по ипотечным кредитам.Уточнение ведем по названию счета с использованием таблицы подмен
+        -- уточнение статьи кредитного договора при изменении типа кредита в cda  идет утром   
+             bs_create.Update_LIB_acc_bs_Ipoteka(DateBeg,FlagUpdateNewBS); 
+       For I in 1..3 
+        loop
+         if I!=2 then
+             idsmr_switch(I);              
+             bs_create.Update_LIB_acc_bs_CreditCard (DateBeg,FlagUpdateNewBS);    
+             bs_create.Update_LIB_acc_bs_Bankomat(DateBeg,FlagUpdateNewBS);      
+         end if ;    
+        end loop;
+       ---------------------------------------------------------------------------------------------  
+       -- обновляем в BS_OST и в BS_ACC_AGR коды стетй, сегментов при изменении оных в случае изменения клиента и типа клиента по счету
+        UPDATE_COD_BS_SEGMENT_BS_OST;     
+         
+      ---------------------------------------------------------------------------------------------  
+       
+        -- меняем флаг нового счета
+        UPDATE lib_acc_bs t set t.flag_new_account=0 
+        WHERE  t.flag_new_account=1
+                 and  not exists (SELECT 1 FROM lib_acc_bs_period p where  t.id_acc=p.id_acc and p.id_cod_bs=138); 
+                    
+end InsertNewAcc;
+
+
+----------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------
+
+
+ -- запись хранения балансовых остатков в статической расскраске
+procedure Save_BS_to_bs_ost( DateBeg in Date, DateEnd in Date) is 
+  
+  N number;
+  ID_DateBeg  number;
+  ID_DateEnd  number;
+                                      
+begin
+ SELECT t.id_date into ID_DateBeg FROM tbldate t where  t.cntdate = DateBeg ;   
+ SELECT t.id_date into ID_DateEnd FROM tbldate t where  t.cntdate = DateEnd ; 
+
+    -- удаляем из хранилища данные по остаткам за период которых нет в bs_temp за этот же период
+     UpdTime_LOG (N,'Load_BS_to_BS_OST','Удаление данных из хранилища bs_ost');     
+    
+     DELETE  FROM bs_ost o
+                 where (o.dacrdate_acr between DateBeg and DateEnd)                                      
+                        and not exists (SELECT 1
+                                         FROM bs_temp d 
+                                         where d.dacrdate_acr=o.dacrdate_acr and d.id_acc= o.id_acc                                        
+                                         ) ;                                              
+      commit;         
+      UpdTime_LOG (N,'','',0);  
+    
+   /*
+   -- уточнение остатков при смене отделения и в случае отсутствия изменения остатка     
+     UpdTime_LOG (N,'Load_BS_to_BS_OST','Уточнение остатков при смене отделения и в случае отсутствия изменения остатка');    
+     -- уточнение остатков при смене отделения и в случае отсутствия изменения остатка     
+    
+    -- список лицевых счетов, у которых сменилось отделение и не отразилось изменение в bs_ost. Это происходит если остатко не изменился
+     insert into BS_TEMP (id_acc, dacrdate_acr, dacrdate,  datenext, balance_val, balance_rub, ID_COD_BS,
+                 ID_SEGMENT,ID_OTD,  typeacc, procedureupdate )                                 
+                                       
+     select o1.id_acc, o1.dacrdate_acr, o1.dacrdate, o1.datenext,o1.balance_val, o1.balance_rub, 
+            o1.ID_COD_BS, o1.ID_SEGMENT,o1.ID_OTD, o1.typeacc, o1.procedureupdate                 
+       FROM bs_ost o1 
+       where o1.id_acc in (select ot.ID_ACC          
+                           from   LIB_ACC_OTD_PERIOD ot
+                           where  ot.dacrdate between DateBeg  and DateEnd
+                            )                
+          and not exists (SELECT 1 FROM bs_temp d 
+                           where d.dacrdate_acr=o1.dacrdate_acr and d.id_acc= o1.id_acc
+                          -- where d.dacrdate=o1.dacrdate and d.id_acc= o1.id_acc  -- Новиков 15.01.20120                                      
+                          ) ;
+        commit;    
+         
+      UpdTime_LOG (N,'','',0);  */
+      
+  
+    
+    -- расскраска, обновление данных и внесение новых 
+     
+     UpdTime_LOG (N,'Load_BS_to_BS_OST','Уточняем или Сохраняем новые данные в хранилище bs_ost');
+        
+     
+       -- обновление значений загруженных ранее
+      merge into bs_ost t
+              using ( SELECT vn.dacrdate, vn.DateNext, vn.Balance_val,vn.Balance_rub, vn.id_acc, vn.ID_COD_BS,
+                             vn.ID_SEGMENT,vn.ID_OTD,vn.ZNAK, vn.typeacc,
+                             vn.Ccusflag,vn.Iacccus,vn.procedureupdate, vn.dacrdate_acr
+                      FROM V_BS_OST_UPD_INS vn
+                       ) d                          
+                    on (d.id_acc=t.id_acc   and t.DACRDATE=d.DACRDATE  )
+             
+              WHEN MATCHED THEN--когда совпали , то идет сам update       
+                      UPDATE SET  
+                                 t.dacrdate_acr=d.dacrdate_acr,                          
+                                 t.datenext=d.datenext,                                
+                                 t.balance_val=d.balance_val,
+                                 t.balance_rub=d.balance_rub, 
+                                 t.ID_COD_BS=d.ID_COD_BS,
+                                 t.ID_SEGMENT=d.ID_SEGMENT,
+                                 t.ID_OTD=d.ID_OTD,
+                                 t.ZNAK =d.ZNAK, 
+                                 t.typeacc=d.typeacc,                                                             
+                                 t.procedureupdate =d.procedureupdate 
+                                                          
+              WHEN NOT MATCHED THEN 
+                insert  (id_acc, dacrdate, DateNext, Balance_val,Balance_rub,ID_COD_BS,ID_SEGMENT,ID_OTD,ZNAK,typeacc,
+                                   procedureupdate,dacrdate_acr)
+                values  (d.id_acc, d.dacrdate, d.DateNext, d.Balance_val, d.Balance_rub,d.ID_COD_BS,d.ID_SEGMENT,d.ID_OTD,d.ZNAK,d.typeacc,
+                                    d.procedureupdate,d.dacrdate_acr);                          
+                                           
+              commit;     
+    UpdTime_LOG (N,'','',0);
+    
+    
+     UpdTime_LOG (N,'Load_BS_to_BS_OST','Уточняем id_datenext в bs_ost');   
+      --  установка последнего значения id_datenext=1  
+      merge into bs_ost t   
+      using  (select  o.id_acc, max(o.dacrdate) as dacrdate, dt.dacrdate  as Datenext
+              
+              FROM bs_ost o, V_BS_OST_UPD_INS dt
+               where dt.id_acc= o.id_acc                                               
+                
+                 and o.DACRDATE<dt.DACRDATE 
+                 
+              group by o.id_acc , dt.dacrdate) d  
+             
+              on (t.id_acc=d.id_acc  and t.dacrdate= d.dacrdate   )   
+     
+      WHEN MATCHED THEN--когда совпали , то идет сам update       
+                     UPDATE SET  t.datenext=d.datenext;
+     commit;  
+     UpdTime_LOG (N,'','',0);   
+   
+   
+ 
+end Save_BS_to_bs_ost;
+-------------------------------------------------------------------
+
+-- сохраняем данные по остаткам на первое число каждого месяца
+procedure Save_BS_to_BS_ACC_AGR(DateBeg in Date, DateEnd in Date) is  
+-- сохраняем данные по остаткам на первое число каждого месяца
+
+
+cntDateBeg date; -- дата начала расчета срднедневных остатков за период
+cntDateEnd date; -- дата завершения расчета срднедневных остатков за период
+cnt_perioddate date;
+N number;
+
+begin
+ cntDateEnd:=DateEnd; 
+ 
+  -- расчет среднедневых агрегатов проводим за прощлый месяц если cntDateEnd=01.xx.xxxx
+    if trunc (DateBeg,'MM')=DateBeg or trunc (DateEnd,'MM')=DateEnd then           
+         
+           IF trunc(DateBeg,'MM')=DateBeg and trunc (DateEnd,'MM')!=DateEnd  then
+                       cntDateBeg:=trunc (DateBeg-1,'MM'); -- начало предшествующего месяца
+                       cntDateEnd:=DateBeg;
+            end if ;          
+                       
+            if trunc (DateBeg,'MM')!=DateBeg and trunc (DateEnd,'MM')=DateEnd then
+                       cntDateBeg:=trunc (cntDateEnd-1,'MM'); -- начало предшествующего месяца
+                       cntDateEnd:=DateEnd;
+            end if ;           
+              
+            if trunc (DateBeg,'MM')=DateBeg and trunc (DateEnd,'MM')=DateEnd  then 
+                           cntDateBeg:=DateBeg;
+                           cntDateEnd:=DateEnd;
+             end if ;   
+            
+             cnt_perioddate:=cntDateEnd;
+             
+                   
+        -- обнуляем данные на первое числе
+                update bs_acc_agr t 
+                        set t.balance_val=0,
+                            t.balance_rub=0, 
+                            t.balance_avr_val=0, 
+                            t.balance_avr_rub=0,
+                            t.correction_val_msfo=0,
+                            t.correction_rub_msfo=0,                                 
+                            t.avr_correction_val_msfo=0,
+                            t.avr_correction_rub_msfo=0 
+                            
+                 where t.date_period= cnt_perioddate;
+               commit; 
+  
+                
+         -- среднедневные остатки за месяц укдадываем        
+     UpdTime_LOG (N,'Save_BS_to_BS_ACC_AGR','Сохраняем среднедневные остатки за месяц'); 
+       bs_create.Insert_AvrBS_Temp (cntDateBeg,cntDateEnd,1);-- закидываем данные остатков во временную таблицу.       
+       bs_create.Decode_IdCodBS_inTable (cntDateBeg,cntDateEnd);-- Расскрашиваем в динамике по статьям -
+    
+    
+       -- ежемесячные остатки укдадываем
+           IF trunc(DateBeg,'MM')=DateBeg and trunc (DateEnd,'MM')!=DateEnd  then  
+                      cntDateEnd:=  DateBeg;
+           end if;           
+                      
+            if trunc (DateBeg,'MM')!=DateBeg and trunc (DateEnd,'MM')=DateEnd then 
+                      cntDateEnd:=  DateEnd;
+            end if;   
+            
+            if trunc (DateBeg,'MM')=DateBeg and trunc (DateEnd,'MM')=DateEnd  then                          
+                           cntDateEnd:=DateEnd;
+            end if ;     
+       
+       bs_create.Insert_BS_TEMP (cntDateEnd,cntDateEnd+1,0);  -- закидываем данные остатков во временную таблицу.        
+       bs_create.Decode_IdCodBS_inTable (cntDateEnd-1,cntDateEnd);-- Расскрашиваем в динамике по статьям -
+      
+           -- обновляем данные в  bs_acc_agr по среднедневным остаткам 
+                           
+              merge into (SELECT * FROM bs_acc_agr u  where u.date_period=cnt_perioddate ) t
+                  using ( SELECT DISTINCT s.id_acc, s.id_otd,s.id_cod_bs,s.ccusflag,s.id_segment,
+                                         nvl(sum(s.balance_val),0) balance_val,
+                                         nvl(sum(s.balance_rub),0) balance_rub,
+                                         nvl(sum(s.balance_avr_val),0) balance_avr_val,
+                                         nvl(sum(s.balance_avr_rub),0) balance_avr_rub,
+                                         
+                                         sum(nvl(s.correction_val_msfo,0)) correction_val_msfo,
+                                         sum(nvl(s.correction_rub_msfo,0)) correction_rub_msfo,
+                                         sum(nvl(s.avr_correction_val_msfo,0)) avr_correction_val_msfo,
+                                         sum(nvl(s.avr_correction_rub_msfo,0)) avr_correction_rub_msfo
+                                         
+                          FROM bs_temp s -- where balance_avr_rub!=0 
+                          group by s.id_acc, s.id_otd,s.id_cod_bs,s.ccusflag,s.id_segment ) d 
+                            on (d.id_acc=t.id_acc and d.id_otd=t.id_otd and t.id_cod_bs=d.id_cod_bs and t.id_segment=d.id_segment and 
+                                d.ccusflag=t.ccusflag )
+                  WHEN MATCHED THEN--когда совпали , то идет сам update       
+                          UPDATE SET t.balance_val=d.balance_val,
+                                     t.balance_rub=d.balance_rub,                                 
+                                     t.balance_avr_val=d.balance_avr_val,
+                                     t.balance_avr_rub=d.balance_avr_rub,
+                                     
+                                     t.correction_val_msfo=d.correction_val_msfo,
+                                     t.correction_rub_msfo=d.correction_rub_msfo,                                 
+                                     t.avr_correction_val_msfo=d.avr_correction_val_msfo,
+                                     t.avr_correction_rub_msfo=d.avr_correction_rub_msfo
+                                     
+                                                                     
+                  WHEN NOT MATCHED THEN -- вставляем новые данные
+                    insert (balance_val, balance_rub,id_cod_bs, id_segment, id_otd, ccusflag, date_period, id_acc, balance_avr_val,balance_avr_rub,
+                             correction_val_msfo,correction_rub_msfo,avr_correction_val_msfo,avr_correction_rub_msfo )
+                    values (d.balance_val,d.balance_rub,d.id_cod_bs,d.id_segment,d.id_otd,d.ccusflag,cnt_perioddate, d.id_acc,d.balance_avr_val,d.balance_avr_rub,
+                            d.correction_val_msfo,d.correction_rub_msfo,d.avr_correction_val_msfo,d.avr_correction_rub_msfo );                       
+                  commit;                        
+          UpdTime_LOG (N,'','',0);
+      
+            
+      
+     end if ;   
+    
+
+end Save_BS_to_BS_ACC_AGR;
+
+
+--------------------------------------------------------------------------------------------
+-- проверка на наличие нового счета и загрузка остатков в BS_OST 
+procedure Load_BS_OST( DateBeg in Date, DateEnd in Date, 
+                       FlagUpdateNewBS in number DEFAULT 1,
+                       FlagSaveAGR in number DEFAULT 0,
+                       FlagSaveDJ in number DEFAULT 0) is
+                       
+-- проверка на наличие нового счета и загрузка остатков в BS_OST 
+
+cntDateBeg date;
+cntDateEnd date;
+I number ;
+
+
+begin   
+ I:=0;
+ cntDateBeg:=DateBeg; 
+
+ if  trunc (DateBeg, 'MM')= trunc (DateEnd-1, 'MM') then
+   -- DateBeg и DateEnd-1 одного месяца                   
+                 cntDateEnd:=DateEnd;
+                
+	               -- берем счета с оборотами по вчерашний день включительно    
+                 bs_create.INSERT_BalXXI_BS_TEMP_Main(cntDateBeg,cntDateEnd-1); -- загрузка данных 
+								               
+                 bs_create.InsertNewAcc(cntDateBeg,   FlagUpdateNewBS ); -- актуализация счетов, кодов статей по счетам
+                 bs_create.Save_BS_to_BS_OST( cntDateBeg,  cntDateEnd-1);  -- сохранение остатков
+                 bs_msfo_create.LoadeMSFOCorrection(cntDateBeg,cntDateEnd); -- формируем корректировки остатков по МСФО
+                 
+                 
+                 dj.InsertNew_DJ_ACC(DateBeg,DateEnd); -- периодическое фотографирование состояния привязки депозитного договора к счетам и запись новых состояний в DJ_ACC 
+                 cd.InsUpdNewInto_CDDOG; -- переодическое фотографирование состояния кредитных договоров
+                  plastic.InsertNew_PLA_ACC ; -- периодическое фотографирование состояния привязки договора пластика к счетам и запись новых состояний в PLA_ACC                    
+                 
+                                           
+              if FlagSaveAGR= 1 and extract(day from cntDateEnd)=1 Then 
+                    bs_create.Save_BS_to_BS_ACC_AGR(trunc(cntDateBeg,'MM'),  cntDateEnd);                     
+                    
+                    /*if FlagSaveDJ=1 then  
+                             dj.SaveDJ_ACC_AGR (trunc(cntDateBeg,'MM'),  cntDateEnd); -- сохраняем агрегаты по депозитам в DJ_ACC_AGR 
+                                                                                      -- и запись идентификатора договора по пластику
+                    end if;    */                                                                  
+                  
+              end if;   
+ else
+ 
+    loop        
+      
+       cntDateEnd := trunc (last_day(cntDateBeg))+1;   -- Последний день месяца +1 
+       if cntDateEnd > DateEnd then   cntDateEnd:= DateEnd ;  end if;          
+         --рекурсия
+           bs_create.Load_BS_OST(cntDateBeg,cntDateEnd,FlagUpdateNewBS,FlagSaveAGR,FlagSaveDJ);
+         
+          cntDateBeg:= cntDateEnd;            
+          exit when cntDateEnd= DateEnd ;   
+          I:=I+1;        
+                   
+      end loop;   
+
+ end if;
+
+
+end Load_BS_OST;
+
+
+
+-- основная процедура загрузки данных остатков во временную таблицу 
+-------------------------------------------------------------------------------------------------------------------------------------------------
+Procedure  INSERT_BalXXI_BS_TEMP_Main (DateBeg in Date, DateEnd in Date) is
+-- основная процедура загрузки данных остатков во временную таблицу 
+
+begin
+  
+
+execute immediate 'truncate table bs_temp';
+    For I in 1..3
+     loop  
+         -- подключаем окружение
+         idsmr_switch(I);
+             
+         -- обновляем/добавляем отделения в LIB_OTD
+           bs_create.Update_LIB_OTD (I); 
+          -- отбираем  сальдо 
+           INSERT_BalXXI_BS_TEMP(DateBeg,DateEnd, I,0); -- берем счета с оборотами по вчерашний день включительно     
+       
+    end loop;
+
+end INSERT_BalXXI_BS_TEMP_Main;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+--  формирование среднедневных остатков за любой период. Разбивка кратна месяцу. Формирование идет напрямую из таблицы BS_OST.  
+procedure Load_AvrBS_Temp( DateBeg in Date, DateEnd in Date) is -- Использовать в пределеах одного месяца
+--  формирование среднедневных остатков за любой период. Разбивка кратна месяцу. Формирование идет напрямую из таблицы BS_OST.  
+
+
+cntDateBeg date;
+cntDateEnd date;
+I number ;
+ 
+begin 
+    
+ I:=0;
+ cntDateBeg:=DateBeg; 
+  
+ -- trunc (DateBeg, 'MM') Первый день месяца
+ 
+ 
+ 
+
+ if  trunc (DateBeg, 'MM')= trunc (DateEnd-1, 'MM') then
+   -- DateBeg и DateEnd-1 одного месяца 
+                 cntDateEnd :=  DateEnd;                               
+                 Insert_AvrBS_Temp (cntDateBeg,  cntDateEnd,1);               -- закидываем остатки за этот период по лицевикам                   
+                 bs_create.Decode_IdCodBS_inTable (cntDateBeg,  cntDateEnd);-- уточняем код BS по динамическим остаткам 
+ else
+ 
+ loop        
+       -- Последний день месяца
+       cntDateEnd := trunc (last_day(cntDateBeg))+1;  
+       if cntDateEnd > DateEnd then   cntDateEnd:= DateEnd ;  end if;                
+        bs_create.Insert_AvrBS_Temp (cntDateBeg,  cntDateEnd,0);                 -- закидываем остатки за этот период по лицевикам         
+        bs_create.Decode_IdCodBS_inTable (cntDateBeg,  cntDateEnd);          -- уточняем код BS по динамическим остаткам
+        cntDateBeg:= cntDateEnd;
+            
+          exit when cntDateEnd= DateEnd ;   
+          I:=I+1;         
+      end loop;   
+
+ end if;
+
+end Load_AvrBS_Temp;
+
+
+
+
+-----------------------------------------------------------------------------------------------------
+--  формирование таблицы динамической выборки  среднедневных балансовых остатков за период DateBeg и DateEnd/ Даты в рамках 1 месяца   
+
+procedure Insert_AvrBS_Temp (DateBeg in date,DateEnd in date, FlagClearTbl in number) is
+--  формирование таблицы динамической выборки  среднедневных балансовых остатков за период DateBeg и DateEnd/ Даты в рамках 1 месяца   
+
+
+
+vDateEnd date;
+cntDays number;
+
+begin  
+
+if FlagClearTbl=1 then 
+   execute immediate 'truncate table bs_temp';
+end if;
+  
+vDateEnd:=DateEnd-1;
+cntDays:=DateEnd-DateBeg;
+
+INSERT /*+ APPEND */ INTO bs_temp (id_acc, id_cod_bs, id_segment,id_otd,  balance_avr_val, balance_avr_rub, procedureupdate,dacrdate,datenext,
+                            AVR_CORRECTION_VAL_MSFO,AVR_CORRECTION_RUB_MSFO, iacccus, ccusflag  )
+
+SELECT  DISTINCT G.id_acc,  G.id_cod_bs, G.id_segment,
+        g.id_otd, 
+        SUM( G.balance_val * (case  
+                                   when   G.datenext >=  DateEnd then  DateEnd-1
+                                   else    G.datenext 
+                                end 
+                                            -                   
+                                case  
+                                    when G.dacrdate < DateBeg then  DateBeg -1
+                                    else   G.dacrdate 
+                                end  )) * G.znak /cntDays as balance_val,
+          
+         sum(G.balance_rub * ( case  
+                                   when   G.datenext>=  DateEnd  then  DateEnd-1
+                                   else    G.datenext 
+                                end 
+                                            -                   
+                                case  
+                                    when G.dacrdate < DateBeg then  DateBeg -1
+                                    else   G.dacrdate 
+                                end )) * G.znak/cntDays  as balance_rub,
+                                
+           g.procedureupdate,
+           DateBeg as dacrdate,
+           vDateEnd as datenext  ,                     
+          
+          
+          
+          SUM( nvl(G.CORRECTION_VAL_MSFO,0) * (case  
+                                                   when   G.datenext >=  DateEnd then  DateEnd-1
+                                                   else    G.datenext 
+                                                end 
+                                                            -                   
+                                                case  
+                                                    when G.dacrdate < DateBeg then  DateBeg -1
+                                                    else   G.dacrdate 
+                                                end  )) * G.znak /cntDays as CORRECTION_VAL_MSFO,
+          
+         
+         sum(nvl(G.CORRECTION_RUB_MSFO,0) * ( case  
+                                                 when   G.datenext>=  DateEnd  then  DateEnd-1
+                                                 else    G.datenext 
+                                              end 
+                                                          -                   
+                                              case  
+                                                  when G.dacrdate < DateBeg then  DateBeg -1
+                                                  else   G.dacrdate 
+                                              end ))* G.znak /cntDays  as CORRECTION_RUB_MSFO
+      ,bs.iacccus                                        
+      ,bs.ccusflag                           
+FROM                                 
+    bs_ost G , LIB_ACC_BS bs   
+         where  (  (g.dacrdate < vDateEnd and  g.datenext>= DateBeg and (g.balance_rub!=0 or nvl(g.correction_rub_msfo,0)!=0 ) )  
+               or ( (g.balance_rub=0  or nvl(G.CORRECTION_RUB_MSFO,0)=0)  and g.dacrdate between DateBeg and  vDateEnd) 
+                       ) and bs.ID_ACC=G.ID_ACC 
+                                         
+  group by G.id_acc,  G.id_cod_bs, G.id_segment, g.id_otd, G.znak, g.procedureupdate, iacccus, ccusflag 
+  
+ 
+  
+    ;
+commit; 
+
+/*-- уточняем данные счета о клиенте
+merge into bs_temp t
+using (SELECT * FROM LIB_ACC_BS z) bs
+on (bs.ID_ACC=t.ID_ACC)
+WHEN MATCHED THEN--когда совпали , то идет сам update       
+   UPDATE SET t.iacccus=bs.iacccus,
+              t.ccusflag=bs.ccusflag;
+commit; */
+
+
+end Insert_AvrBS_Temp;
+
+---------------------------------------------------------------------------------------------------------------------------
+
+--  формирование таблицы динамической выборки  балансовых остатков за период DateBeg и DateEnd не более 1 дня ( для получения остатков на любую дату) 
+
+procedure Insert_BS_TEMP (DateBeg in date,DateEnd in date, FlagClearTbl in number  )  is
+--  формирование таблицы динамической выборки  балансовых остатков за период DateBeg и DateEnd не более 1 дня ( для получения остатков на любую дату) 
+
+
+vDateEnd date;
+
+
+
+begin 
+   
+if FlagClearTbl=1 then 
+   execute immediate 'truncate table bs_temp';
+end if;
+ 
+vDateEnd:= DateEnd-1;
+
+
+INSERT /*+ APPEND */ INTO bs_temp (id_acc,  id_cod_bs, id_segment, id_otd,  balance_val, balance_rub,correction_val_msfo,correction_rub_msfo, 
+                                   dacrdate, datenext,procedureupdate,iacccus, ccusflag )                    
+SELECT    G.id_acc,     
+          G.id_cod_bs,
+          G.id_segment,
+          G.ID_OTD,
+         
+           G.balance_val*G.znak ,
+           G.balance_rub*G.znak,
+           nvl(G.CORRECTION_VAL_MSFO,0)*G.znak ,
+           nvl(G.CORRECTION_RUB_MSFO,0)*G.znak ,
+           
+           DateBeg,
+           vDateEnd,
+           G.procedureupdate,
+           bs.iacccus,
+           bs.ccusflag
+FROM 
+  bs_ost G ,LIB_ACC_BS  bs      
+              where bs.ID_ACC=g.ID_ACC and 
+               g.dacrdate < vDateEnd and  g.datenext>= DateBeg  and (g.balance_rub!=0 or nvl(g.correction_rub_msfo,0)!=0)                      
+ 
+   
+   ; 
+commit; 
+
+/*-- уточняем данные счета о клиенте
+merge into bs_temp t
+using (SELECT * FROM LIB_ACC_BS z) bs
+on (bs.ID_ACC=t.ID_ACC)
+WHEN MATCHED THEN--когда совпали , то идет сам update       
+   UPDATE SET t.iacccus=bs.iacccus,
+              t.ccusflag=bs.ccusflag;
+commit;       */             
+
+end Insert_BS_TEMP;
+
+---------------------------------------------------------------------------------------------------------------------------------
+-- уточняем код BS по динамическим остаткам в таблице
+procedure Decode_IdCodBS_inTable( DateBeg in date,DateEnd in date)   is
+
+begin
+  
+update bs_temp t 
+set  t.id_cod_bs=(SELECT distinct p.id_cod_bs_new  
+                   FROM  groupclient Cl, lib_podmen_cod_bs p 
+                   where Cl.id_client=t.iacccus  and p.id_cod_bs_old=t.id_cod_bs 
+                    and  p.metka=cl.groupclient 
+                    and  p.metka in ('Корпорат','Крупные','Выделенный клиент') 
+                    and Cl.date_beg<DateEnd  and Cl.date_end>DateBeg ),
+      t.procedureupdate ='Аналитическое уточнение lib_analitcorrect_cod_bs'                
+                         
+where exists ( SELECT distinct p.id_cod_bs_new  
+                   FROM  groupclient Cl, lib_podmen_cod_bs p 
+                   where Cl.id_client=t.iacccus  and p.id_cod_bs_old=t.id_cod_bs and  p.metka=cl.groupclient and  p.metka in ('Корпорат','Крупные','Выделенный клиент') 
+                          and Cl.date_beg<DateEnd  and Cl.date_end>DateBeg )-- and t.procedureupdate!='Аналитическое уточнение lib_analitcorrect_cod_bs' 
+                          ;                        
+
+    
+commit;  
+
+end Decode_IdCodBS_inTable;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+procedure Rashifrovka_BS (DateBeg in date,
+                          cCOD_BS in nvarchar2, 
+                          cID_SEGMENT in nvarchar2 , 
+                          cID_OTD in nvarchar2,
+                          cIDccusflag in nvarchar2 )  is
+  -- формирование расшифровки баланса
+
+tblIDCodBS number_array;
+tblID_SEGMENT number_array;
+tblID_OTD number_array;
+tblIDccusflag number_array;
+            
+
+begin  
+execute immediate 'truncate table bs_temp';
+execute immediate 'truncate table bs_temp_rash';
+execute immediate 'truncate table temp_param';
+
+tblIDCodBS:=pk_array_id.Return_ARR_ID_COD_BS(cCOD_BS);
+ insert into temp_param(id_cod_bs) 
+ select * from table(tblIDCodBS);
+ commit;
+
+tblID_SEGMENT:=pk_array_id.Return_ARR_ID_SEGMENT (cID_SEGMENT);
+ insert into temp_param(ID_SEGMENT) 
+ select * from table(tblID_SEGMENT);
+ commit;
+
+tblID_OTD:=pk_array_id.Return_ARR_ID_OTD (cID_OTD);
+ insert into temp_param(id_otd) 
+ select * from table(tblID_OTD);
+ commit;
+
+tblIDccusflag:=pk_array_id.Return_ARR_ID_CcusFlag (cIDccusflag);
+ insert into temp_param(ccusflag) 
+ select * from table(tblIDccusflag);
+ commit;
+
+
+  
+if trunc(DateBeg,'MM') =DateBeg then
+   
+
+   -- вставляем расскрашенные данные остатков на первое число месяца в  bs_temp
+     INSERT /*+ APPEND */ INTO bs_temp_rash (caccacc,cacccur,cod_bs,namesegment,cotdname,ccusflag_name, balance_val, balance_rub,
+                                        procedureupdate,dacrdate,ID_COD_BS,ID_SEGMENT,CCUSFLAG, id_acc,IACCCUS,ID_OTD,
+                                        correction_val_msfo,correction_rub_msfo)
+      SELECT t.caccacc,t.cacccur,t.cod_bs,t.namesegment,t.cotdname,t.ccusflag_name,t.BALANCE_VAL,t.BALANCE_RUB,
+             t.procedureupdate, DateBeg ,t.ID_COD_BS,t.ID_SEGMENT,t.CCUSFLAG,t.ID_ACC,t.IACCCUS,t.ID_OTD,
+             t.CORRECTION_VAL_MSFO,t.CORRECTION_RUB_MSFO
+      FROM V_RASHIFROVKI_BS_01 t
+       where t.ID_COD_BS in (select z.id_cod_bs from temp_param z where not z.id_cod_bs is NULL )
+             and t.ID_SEGMENT in (select z.id_segment from temp_param z where not z.id_segment is NULL)
+             and t.ID_OTD in (select z.id_otd from temp_param z where not z.id_otd is NULL ) 
+             and t.CCUSFLAG in (select z.ccusflag from temp_param z where not  z.ccusflag is NULL)                
+             and (t.BALANCE_RUB!=0  or nvl(t.CORRECTION_RUB_MSFO,0)!=0) 
+             and t.date_period=DateBeg
+                             
+           ;
+     commit; 
+else 
+  
+        -- закидываем данные остатков во временную таблицу на != 01.   
+         bs_create.Insert_BS_TEMP (DateBeg,DateBeg+1,1); --,cID_SEGMENT,cID_OTD,cIDccusflag);
+         bs_create.Decode_IdCodBS_inTable (DateBeg,DateBeg+1);-- Расскрашиваем в динамике по статьям   
+       
+       INSERT /*+ APPEND */ INTO bs_temp_rash (caccacc,cacccur,cod_bs,namesegment,cotdname,ccusflag_name, balance_val, balance_rub,
+                                               procedureupdate, dacrdate,ID_COD_BS,ID_SEGMENT,CCUSFLAG, id_acc,IACCCUS,ID_OTD,
+                                               correction_val_msfo,correction_rub_msfo)
+            SELECT t.caccacc,t.cacccur,t.cod_bs,t.namesegment,t.cotdname,t.ccusflag_name,t.BALANCE_VAL,t.BALANCE_RUB,
+                   t.procedureupdate,DateBeg,t.ID_COD_BS,t.ID_SEGMENT,t.CCUSFLAG,t.ID_ACC,t.IACCCUS,t.ID_OTD,
+                   t.correction_val_msfo, t.correction_rub_msfo
+            FROM V_RASHIFROVKI_BS t
+             where t.ID_COD_BS in (select z.id_cod_bs from temp_param z where not z.id_cod_bs is NULL )
+                   and t.ID_SEGMENT in (select z.id_segment from temp_param z where not z.id_segment is NULL)
+                   and t.ID_OTD in (select z.id_otd from temp_param z where not z.id_otd is NULL ) 
+                   and t.CCUSFLAG in (select z.ccusflag from temp_param z where not  z.ccusflag is NULL)                
+                   and (t.BALANCE_RUB!=0  or nvl(t.CORRECTION_RUB_MSFO,0)!=0)
+                   and t.dacrdate<=DateBeg and DateBeg<t.datenext                   
+                 ;
+           commit;
+         --  g.dacrdate < DateBeg and  g.datenext>= DateBeg    vDateEnd:= DateEnd-1;          
+ end if;                                    
+
+For I in 1..3
+     loop  
+         -- подключаем окружение
+         idsmr_switch(I);
+         update bs_temp_rash r set r.caccname=(SELECT distinct a.CACCNAME FROM xxi.acc a where a.CACCACC=r.caccacc),
+                                   r.ccusname=(SELECT distinct cu.ccusname FROM xxi."cus" cu where cu.icusnum=r.IACCCUS)
+         where r.ccusname is null
+           and r.id_cod_bs in (select b.id_cod_bs --обезличивание данных
+                                   from V_IS_DETAIL_INFO t, Lib_Cod_Bs  b
+                                    where b.cod_bs=t.value and t.objectname='LIB_COD_BS.COD_BS' 
+                                      and t.login_ad = SYS_CONTEXT ( 'userenv', 'OS_USER' )) ;
+           
+         
+        
+                                 
+                                            
+ end loop;
+
+end Rashifrovka_BS;
+---------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+  -- формирование расшифровки баланса
+procedure Rashifrovka_AVRBS (DateBeg in date,
+                             DateEnd in date,
+                             cCOD_BS in nvarchar2, 
+                             cID_SEGMENT in nvarchar2, 
+                             cID_OTD in nvarchar2,
+                             cIDccusflag in nvarchar2 )  is
+  -- формирование расшифровки баланса
+
+tblIDCodBS number_array;
+tblID_SEGMENT number_array;
+tblID_OTD number_array;
+tblIDccusflag number_array;
+                 
+
+begin  
+
+execute immediate 'truncate table bs_temp';
+execute immediate 'truncate table bs_temp_rash';
+execute immediate 'truncate table temp_param';
+
+tblIDCodBS:=pk_array_id.Return_ARR_ID_COD_BS(cCOD_BS);
+ insert into temp_param(id_cod_bs) 
+ select * from table(tblIDCodBS);
+ commit;
+
+tblID_SEGMENT:=pk_array_id.Return_ARR_ID_SEGMENT (cID_SEGMENT);
+ insert into temp_param(ID_SEGMENT) 
+ select * from table(tblID_SEGMENT);
+ commit;
+
+tblID_OTD:=pk_array_id.Return_ARR_ID_OTD (cID_OTD);
+ insert into temp_param(id_otd) 
+ select * from table(tblID_OTD);
+ commit;
+
+tblIDccusflag:=pk_array_id.Return_ARR_ID_CcusFlag (cIDccusflag);
+ insert into temp_param(ccusflag) 
+ select * from table(tblIDccusflag);
+ commit;
+
+
+if trunc(DateBeg,'MM')=DateBeg and trunc(DateEnd,'MM')=DateEnd then
+  
+
+  
+    -- вставляем расскрашенные данные остатков на первое число месяца в  bs_temp
+     INSERT /*+ APPEND */ INTO bs_temp_rash ( caccacc,cacccur,cod_bs,namesegment,cotdname,ccusflag_name, balance_avr_val, balance_avr_rub,
+                                             procedureupdate,dacrdate,datenext,  ID_COD_BS,ID_SEGMENT,CCUSFLAG, id_acc,IACCCUS,ID_OTD,
+                                             correction_val_msfo, correction_rub_msfo,avr_correction_val_msfo, avr_correction_rub_msfo)
+      SELECT t.caccacc,t.cacccur,t.cod_bs,t.namesegment,t.cotdname,t.ccusflag_name,t.BALANCE_AVR_VAL,t.BALANCE_AVR_RUB,
+             t.procedureupdate,DateBeg, DateEnd ,t.ID_COD_BS,t.ID_SEGMENT,t.CCUSFLAG,t.ID_ACC,t.IACCCUS,t.ID_OTD,
+             t.correction_val_msfo, t.correction_rub_msfo, t.AVR_CORRECTION_VAL_MSFO, t.AVR_CORRECTION_RUB_MSFO
+      FROM V_RASHIFROVKI_BS_01 t
+       where t.date_period=DateEnd
+             and t.ID_COD_BS in (select z.id_cod_bs from temp_param z where not z.id_cod_bs is NULL )
+                 and t.ID_SEGMENT in (select z.id_segment from temp_param z where not z.id_segment is NULL)
+                 and t.ID_OTD in (select z.id_otd from temp_param z where not z.id_otd is NULL ) 
+                 and t.CCUSFLAG in (select z.ccusflag from temp_param z where not  z.ccusflag is NULL)
+             and (t.BALANCE_AVR_RUB!=0  or nvl(t.avr_correction_rub_msfo,0)!=0)            
+           ; 
+     commit;     
+     
+else 
+      -- закидываем данные остатков во временную таблицу на != 01. Расскрашиваем в динамике по статьям 
+         bs_create.Insert_AvrBS_Temp (DateBeg,DateEnd,1);-- закидываем данные остатков во временную таблицу. 
+         bs_create.Decode_IdCodBS_inTable (DateBeg,DateEnd);-- Расскрашиваем в динамике по статьям   
+      
+
+     INSERT /*+ APPEND */ INTO bs_temp_rash ( caccacc,cacccur,cod_bs,namesegment,cotdname,ccusflag_name, balance_avr_val, balance_avr_rub,
+                                             procedureupdate,dacrdate,datenext,  ID_COD_BS,ID_SEGMENT,CCUSFLAG, id_acc,IACCCUS,ID_OTD,
+                                             correction_val_msfo, correction_rub_msfo,avr_correction_val_msfo, avr_correction_rub_msfo)
+      SELECT t.caccacc,t.cacccur,t.cod_bs,t.namesegment,t.cotdname,t.ccusflag_name,t.BALANCE_AVR_VAL,t.BALANCE_AVR_RUB,
+             t.procedureupdate,DateBeg, DateEnd ,t.ID_COD_BS,t.ID_SEGMENT,t.CCUSFLAG,t.ID_ACC,t.IACCCUS,t.ID_OTD,
+             t.correction_val_msfo, t.correction_rub_msfo, t.AVR_CORRECTION_VAL_MSFO, t.AVR_CORRECTION_RUB_MSFO
+          FROM V_RASHIFROVKI_BS t
+           where t.ID_COD_BS in (select z.id_cod_bs from temp_param z where not z.id_cod_bs is NULL )
+                 and t.ID_SEGMENT in (select z.id_segment from temp_param z where not z.id_segment is NULL)
+                 and t.ID_OTD in (select z.id_otd from temp_param z where not z.id_otd is NULL ) 
+                 and t.CCUSFLAG in (select z.ccusflag from temp_param z where not  z.ccusflag is NULL)
+                 and (t.BALANCE_AVR_RUB!=0  or nvl(t.avr_correction_rub_msfo,0)!=0) 
+                 and  t.dacrdate<DateEnd and DateBeg<=t.datenext                
+               ;
+         commit;
+ 
+end if;
+ 
+For I in 1..3
+     loop  
+         -- подключаем окружение
+         idsmr_switch(I);
+         update bs_temp_rash r set r.caccname=(SELECT distinct a.CACCNAME FROM xxi.acc a where a.CACCACC=r.caccacc),
+                                   r.ccusname=(SELECT distinct cu.ccusname FROM xxi."cus" cu where cu.icusnum=r.IACCCUS)
+          where r.ccusname is null
+                and r.id_cod_bs in (select b.id_cod_bs --обезличивание данных
+                                   from V_IS_DETAIL_INFO t, Lib_Cod_Bs  b
+                                    where b.cod_bs=t.value and t.objectname='LIB_COD_BS.COD_BS' 
+                                      and t.login_ad = SYS_CONTEXT ( 'userenv', 'OS_USER' )) 
+                                      ;                       
+                                            
+ end loop;
+ 
+end Rashifrovka_AvrBS;
+
+
+-----------------------------------------------------------------------------------------------------------
+/* обновление кодов BS в таблице BS_OST после уточнения привязки новых счетов к статьям и сегментам, 
+                                    или после перепривязки старых счетов к другим статьям или сегмента */
+procedure ReUpdate_BS_OST (DateBeg in date,  FlagUpdateNewBS in number DEFAULT 1) is
+ -- DateBeg  - начало года за который выполняется пересчет и обновление данных
+ -- DateEnd - конец года
+begin
+
+bs_create.InsertNewAcc (DateBeg ,  FlagUpdateNewBS);
+
+
+-- обновляем статистические коды статей и сегментов в  bs_ost которые имеют одну версию расскраски и по которым произошли изменения в кодах 
+UpdTime_LOG (N,'ReUpdate_BS_OST','0.Обновление статей и сегментов в таблице bs_ost'); 
+merge into  (SELECT o.* FROM   bs_ost o where o.id_acc in (SELECT s.id_acc FROM LIB_ACC_BS s where s.flag_new_account=FlagUpdateNewBS)) t 
+ using (SELECT p.id_acc, p.id_cod_bs, p.id_segment, p.procedureupdate 
+        FROM lib_acc_bs_period p 
+         where p.id_acc  in (Select distinct n.id_acc from LIB_ACC_BS_Period n group by n.id_acc having count(*)=1)                
+         ) h
+ on (t.id_acc=h.id_acc and (t.id_cod_bs!=h.id_cod_bs or t.id_segment!=h.id_segment )
+    )
+ when matched then
+    update set t.id_cod_bs=h.id_cod_bs,
+               t.id_segment=h.id_segment,
+               t.procedureupdate=h.procedureupdate;
+commit;              
+               
+ UpdTime_LOG (N,'','',0);              
+
+-- обновляем статистические коды статей и сегментов в  bs_ost которые имеют более однй версию расскраски и по которым произошли изменения в кодах 
+UpdTime_LOG (N,'ReUpdate_BS_OST','1.Обновление статей и сегментов в таблице bs_ost');                  
+merge into  bs_ost t
+ using ( select o.id_acc ,       
+                 bs.procedureupdate,
+                 bs.id_cod_bs,
+                 bs.id_segment,
+                 bs.znak,                
+                 o.balance_val,
+                 o.balance_rub,
+                 o.id_otd,                              
+                 o.typeacc,               
+                 Greatest(bs.dacrdate,o.dacrdate) as dacrdate,
+                 least(bs.datenext,o.datenext) as datenext,
+                 o.dacrdate_acr,
+                 o.correction_val_msfo,
+                 o.correction_rub_msfo
+          from bs_ost o, LIB_ACC_BS_Period bs       
+          where  o.id_acc=bs.id_acc  
+             and bs.id_acc in (Select distinct n.id_acc from LIB_ACC_BS_Period n group by n.id_acc having count(*)>1)
+             and Greatest(bs.dacrdate,o.dacrdate)<least(bs.datenext,o.datenext) ) h
+                    
+ on (t.id_acc=h.id_acc and t.dacrdate=h.dacrdate and  (t.id_cod_bs!=h.id_cod_bs or t.id_segment!=h.id_segment)
+    )
+ when matched then
+    update set  t.datenext=h.datenext -- завершаем действие кода по остатку
+               
+  when not matched then  
+       -- создаем новое действие кода по остатку              
+          insert (id_acc,balance_val,balance_rub,id_otd,id_cod_bs,id_segment,znak,typeacc,procedureupdate,dacrdate,datenext,dacrdate_acr,
+                                                                                             correction_val_msfo,correction_rub_msfo)         
+          values (h.id_acc, h.balance_val, h.balance_rub, h.id_otd, h.id_cod_bs, h.id_segment, h.znak, h.typeacc,h.procedureupdate, h.dacrdate,h.datenext,
+                                                                                           h.dacrdate_acr, h.correction_val_msfo, h.correction_rub_msfo);              
+commit;
+               
+ UpdTime_LOG (N,'','',0);
+
+end ReUpdate_BS_OST;
+
+-----------------------------------------------------------------------------------------------------------
+
+-- массовая перезапись остатков. Если таблица BS_OST стала кривой
+procedure Reload_BS_OST (DateBeg in date, DateEnd in date) is
+  -- массовая перезапись остатков. Если таблица BS_OST стала кривой или прошли изменения в привязке счетов или 
+                  -- изменилисть правила расскраски счетов.
+  --Перезапись в рамках одного года!!!!!!!!!!!!
+ 
+ 
+
+cntDateBeg date;
+cntDateEnd date;
+I number ;
+cntPlogenieCB nvarchar2(100);
+
+begin 
+  
+ -- определяем действующее положение ЦБ 
+if DateBeg<to_date('01.01.2016','dd.mm.yyyy') and DateEnd<=to_date('01.01.2016','dd.mm.yyyy') then   
+   cntPlogenieCB:='385-П';
+else  
+   cntPlogenieCB:='446-П';
+end if; 
+ 
+  
+ I:=0;
+ cntDateBeg:=DateBeg; 
+    
+     -- перекодирование счетов
+     bs_create.InsertNewAcc(DateBeg,0); 
+     -- расскрашиваем библиотеку типов транзакций кодами PL      
+     pl_create.Update_LIB_TRN_PL (DateBeg,cntPlogenieCB, 0);
+  
+ 
+  loop       
+      
+     
+     cntDateEnd := trunc (last_day(cntDateBeg))+1;   -- Последний день месяца +1      
+     if cntDateEnd > DateEnd then   cntDateEnd:= DateEnd ;  end if;
+        -- bs_create.INSERT_BalXXI_BS_TEMP_main(cntDateBeg,  cntDateEnd);         
+        --  bs_create.Save_BS_to_BS_OST( cntDateBeg , cntDateEnd );                                                                                                                            
+        -- bs_create.Save_BS_to_BS_ACC_AGR(cntDateBeg,  cntDateEnd);
+         pl_create.Load_PL_TRN (cntDateBeg,cntDateEnd);        
+         
+          cntDateBeg:= cntDateEnd;            
+          exit when cntDateEnd= DateEnd ;   
+          I:=I+1;
+      end loop;
+
+end Reload_BS_OST;
+
+----------------------------------------------------------------------------------
+procedure InsertOSV(DateBeg in date, DateEnd in date, strMaskAcc in varchar2,  p_recordset  in out sys_refcursor ) is
+--получение ОСВ за любой период времени  
+
+begin  
+  
+execute immediate 'truncate table BS_TEMP_RASH';
+commit;
+execute immediate 'truncate table bs_temp';
+commit;
+
+
+--strMaskAcc1:='202%';
+--select t.parametr into strMaskAcc1  from LIB_OTCHET_PARAM t where t.otchetname='Маски счетов ОСВ для ЦБ';
+insert into BS_TEMP_RASH (caccacc,cacccur)
+SELECT b.caccacc,b.CACCCUR FROM table (pk_Array_ID.str2_varchartbl(strMaskAcc,',')) t, xxi."acc" b where b.caccacc like t.column_value  ;
+commit;
+
+
+
+--insert into  bs_temp_r (caccacc, balance_val, balance_rub, balance_avr_val, balance_avr_rub)
+
+open p_recordset for
+
+select distinct d.CACRACC, 
+                abs(sum(BalOst_In)) as BalOst_In, 
+                abs(sum (MACRDEBOB_RUB)) as MACRDEBOB_RUB, 
+                abs(sum(MACRCREDOB_RUB)) as MACRCREDOB_RUB,
+                abs(sum(BalOst_Out)) as BalOst_Out 
+
+from
+
+( 
+select  a.CACRACC,  a.MACRDEBOB_RUB - a.MACRCREDOB_RUB as BalOst_In, -MACRDEBOB_RUB as MACRDEBOB_RUB,  -MACRCREDOB_RUB as MACRCREDOB_RUB,   0 as BalOst_Out 
+from xxi.acr a,  
+
+           (SELECT distinct g.CACRACC,g.CACRCUR, max(g.DACRDATE) as DACRDATE  
+           FROM xxi.acr g, BS_TEMP_RASH r
+           where g.DACRDATE < DateBeg 
+             and r.caccacc=g.CACRACC
+             and r.cacccur=g.CACRCUR
+             AND substr(g.CACRACC,1,1) not in ('8')        
+             AND substr(g.CACRACC,1,4) not in ('1000','9999')          
+           group by     g.CACRACC,g.CACRCUR) d
+  
+where a.CACRACC=d.CACRACC  and a.CACRCUR=d.CACRCUR and d.DACRDATE =a.DACRDATE 
+                                        
+ union all
+ 
+ select a.CACRACC , 0 as BalOst_In, MACRDEBOB_RUB as MACRDEBOB_RUB,  MACRCREDOB_RUB as MACRCREDOB_RUB,   a.MACRDEBOB_RUB - a.MACRCREDOB_RUB as BalOst_Out 
+from xxi.acr a,  
+
+           (SELECT distinct g.CACRACC,g.CACRCUR, max(g.DACRDATE) as DACRDATE  
+           FROM xxi.acr g,BS_TEMP_RASH r
+           where g.DACRDATE < DateEnd
+             and r.caccacc=g.CACRACC
+             and r.cacccur=g.CACRCUR
+             AND substr(g.CACRACC,1,1) not in ('8')        
+             AND substr(g.CACRACC,1,4) not in ('1000','9999')          
+           group by     g.CACRACC,g.CACRCUR) d
+  
+where a.CACRACC=d.CACRACC  and a.CACRCUR=d.CACRCUR and d.DACRDATE =a.DACRDATE 
+                                
+                                           
+  ) d  
+    
+ group by  d.CACRACC 
+ 
+ having abs(sum (MACRDEBOB_RUB))!=0 or  abs(sum(MACRCREDOB_RUB))!=0 or abs(sum(BalOst_In))!=0 or  abs(sum(BalOst_Out))!=0
+
+  
+  ;
+
+commit;
+
+
+
+
+end  InsertOSV;
+----------------------------------------------------------------------------------
+
+
+
+begin
+
+MaxDate:=to_date('01.01.3000','dd.mm.yyyy'); 
+MinDate:=to_date('01.01.2014','dd.mm.yyyy');
+FlagFoto:=1; 
+
+end BS_CREATE;
