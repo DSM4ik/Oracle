@@ -1,0 +1,1138 @@
+create or replace package body PL_create is
+
+ -- Private type declarations
+  --type <TypeName> is <Datatype>;
+  
+  -- Private constant declarations
+ -- <ConstantName> constant <Datatype> := <Value>;
+
+  -- Private variable declarations
+ --- <VariableName> <Datatype>;
+  
+--cntPlogenieCB nvarchar2(100);
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------
+procedure INS_NEW_Symb_LIB_PL(cntPlogenieCB in varchar2,  FlagUpdateNew in  number DEFAULT 1 ) is
+-- заносим новые символы в библиотеку LIB_PL с ID_COD_PL=300 и ID_SEGMENT=2
+
+N number;
+vDATEUPDATE date;
+DateBegYear date;
+
+begin 
+      UpdTime_LOG (N,'INSERTNEWTRN','запись новых хвостов транзакций в LIB_PL '); 
+			vDATEUPDATE:=sysdate;
+			
+	if cntPlogenieCB='446-П' then 		
+			DateBegYear:=to_date('01.01.2016','dd.mm.yyyy'); 
+	else
+		  DateBegYear:=to_date('01.01.2014','dd.mm.yyyy'); 
+	end if;		 
+         
+				  INSERT INTO LIB_PL_CB (SYMBOL, POLOGENIE_CB)
+            (SELECT distinct substr(t.acc_staff,14,5), cntPlogenieCB
+             FROM lib_trn_pl t
+             WHERE  t.flag_new_account=FlagUpdateNew
+                    and t.acc_staff!='0' 
+                    and t.pologenie_cb=cntPlogenieCB 
+                    and not exists(SELECT * FROM LIB_PL_CB b where b.pologenie_cb=t.pologenie_cb and substr(t.acc_staff,14,5)= b.SYMBOL)
+             );
+            commit           
+            ;
+         
+         INSERT INTO LIB_PL (SYMBOLTAIL, id_cod_pl,id_segment,znak,pologenie_cb,symbol,DACRDATE,DATENEXT,DATEUPDATE,NAMELICSHET)
+            (SELECT distinct substr(t.acc_staff,14,7),300,2,1,cntPlogenieCB,substr(t.acc_staff,14,5),DateBegYear,'01.01.3000',vDATEUPDATE,
+						   (SELECT u.CACCNAME_SH FROM xxi."acc" u where u.CACCACC like '7%' and substr(u.CACCACC,14,7)=substr(t.acc_staff,14,7) and rownum=1)
+             FROM lib_trn_pl t
+             WHERE  t.flag_new_account=FlagUpdateNew
+						        and t.acc_staff!='0' 
+                    and t.pologenie_cb=cntPlogenieCB 
+                    and not exists(SELECT * FROM LIB_PL b where b.pologenie_cb=t.pologenie_cb and substr(t.acc_staff,14,7)= b.symboltail)
+             );
+            commit           
+            ;     
+      UpdTime_LOG (N,'','',0); 
+
+end INS_NEW_Symb_LIB_PL;
+------------------------------------------------------------------------------------------------------------------------------
+
+
+procedure UPDATE_CODPL_SEGM_LIB_TRN_PL(DateBeg in date, cntPlogenieCB in varchar2, FlagUpdateNew in  number DEFAULT 1 ) is
+-- обновляем типы транзакций кодами и сегментами 
+
+N number;
+v_DateBegYear date;
+
+begin 
+
+v_DateBegYear:=trunc(DateBeg,'yyyy');
+
+  UpdTime_LOG (N,'INSERTNEWTRN','обновляем коды статей и сегментов в lib_trn_pl');
+
+ 
+ 
+ merge into (SELECT  f.* FROM  lib_trn_pl f where f.pologenie_cb=cntPlogenieCB and f.flag_new_account=FlagUpdateNew) z 
+						       
+      using (SELECT p.symboltail,p.id_cod_pl,p.id_segment,p.znak, p.pologenie_cb, p.dacrdate
+             FROM  lib_pl p
+             where p.dacrdate<=v_DateBegYear and p.Datenext>v_DateBegYear  -- действующая привязка символа к статье
+             ) d
+      on (z.symboltail=d.symboltail and z.pologenie_cb=d.pologenie_cb)
+      
+      when matched then
+         update set z.id_cod_pl =d.id_cod_pl,
+                    z.id_segment=d.id_segment,                   
+                    z.procedureupdate='Первичная кодировка PL',                   
+                    z.dacrdate=d.dacrdate;	
+	
+	 commit;             
+   UpdTime_LOG (N,'','',0); 
+	
+	 
+end UPDATE_CODPL_SEGM_LIB_TRN_PL;
+
+------------------------------------------------------------------------------------------------------------------------------
+
+
+procedure UPDATE_IPOTEKA_LIB_TRN_PL_TEMP (DateBeg in date) is
+-- уточнение статьи PL по ипотечным проводкам в завершающем хранении
+
+N number;
+I number;
+begin 
+ 
+ UpdTime_LOG (N,'INSERTNEWTRN','уточнение статьи PL по ипотечным проводкам в LIB_TRN_PL_TEMP');
+ 
+         FOR ref_cur in 
+           (select z.id_cod_pl_old ,z.id_cod_pl_new from lib_podmen_cod_pl z where z.metka='Ипотека' ) 
+         loop						
+					For I in 1..3 
+						loop
+							 if I!=2 then 
+									 idsmr_switch(I);                   
+                 
+                if  DateBeg>=to_date('01.01.2018','dd.mm.yyyy') then 
+                    
+                    update LIB_TRN_PL_TEMP V
+                    set   V.id_cod_pl= ref_cur.id_cod_pl_new,
+                             V.procedureupdate ='Аналитическое уточнение lib_podmen_cod_pl'
+                     where  V.id_cod_pl=ref_cur.id_cod_pl_old                                            
+                        and exists(select t.icdetrnnum, t.icdetrnanum 
+                                   from XXI.CDE t
+                                   where t.icdetrnnum=v.itrnnum and  t.icdetrnanum =v.itrnanum 
+                                      and exists (SELECT 1 
+                                                  FROM xxi.CDA a 
+                                                  where a.NCDAAGRID=t.ncdeagrid
+                                                   and exists (SELECT 1  
+                                                               FROM LIB_CREDITGROUPDOG c 
+                                                               where c.icauid=a.ICDAPURPOSE and CREDITGROUPNAME='Ипотечный кредит')
+                                         )
+                                   )       
+                         ;               
+                         
+                   else      
+                      update LIB_TRN_PL_TEMP V
+                          set   V.id_cod_pl= ref_cur.id_cod_pl_new,
+                                   V.procedureupdate ='Аналитическое уточнение lib_podmen_cod_pl'
+                           
+                           where  V.id_cod_pl=ref_cur.id_cod_pl_old 
+                             and (instr(lower(v.ctrnpurp ),'и/к')>0 
+                                                               or instr(lower(v.ctrnpurp ),'ипотеч')>0 
+                                                                         or instr(lower(v.ctrnpurp ), '08-1-0001 икр от 20.08.2008')>0)                                          
+                         ;     
+                    end if; 
+                       
+									  commit; 
+									end if;	
+						end loop;	
+					end loop;
+    
+ UpdTime_LOG (N,'','',0);     
+
+end  UPDATE_IPOTEKA_LIB_TRN_PL_TEMP;
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------
+
+procedure UPDATE_CODBS_LIB_TRN_PL(DateBeg in date, cntPlogenieCB in varchar2, FlagUpdateNew in  number DEFAULT 1 ) is
+-- обновляем данные о статье BS в таблице lib_trn_pl
+
+ID_DATEBEG_YEAR number;
+DATEBEG_YEAR date;
+N number;
+begin
+  
+ UpdTime_LOG (N,'INSERTNEWTRN','обновляем данные о статье BS  в lib_trn_pl');
+ DATEBEG_YEAR:=trunc(DateBeg,'yyyy');
+  select t.id_date into ID_DATEBEG_YEAR FROM tbldate t where t.cntdate=trunc(DateBeg,'yyyy');
+ 
+ merge into (SELECT * 
+             FROM lib_trn_pl 
+						 where pologenie_cb=cntPlogenieCB 
+              and (flag_new_account=FlagUpdateNew or ID_COD_BS is null or ID_COD_BS=138 or ID_SEGMENT_BS is null )) t
+ using (SELECT bs.caccacc,bs.cacccur, b.id_cod_bs as id_cod_bs_New,b.id_segment as  id_segment_NEW  
+        FROM lib_acc_bs bs, lib_acc_bs_period b where b.id_acc=bs.id_acc and
+				           b.dacrdate<=DATEBEG_YEAR and b.datenext>DATEBEG_YEAR )  d
+ on (t.acc=d.caccacc and d.cacccur=t.ctrncur_a )
+ 
+ when matched then
+	  update set t.ID_COD_BS=d.ID_COD_BS_NEW,
+		           t.ID_SEGMENT_BS=d.ID_SEGMENT_NEW ;  
+ 
+
+     commit;       
+ UpdTime_LOG (N,'','',0);
+end UPDATE_CODBS_LIB_TRN_PL;
+------------------------------------------------------------------------------------------------------------------------------
+/*procedure UPDATE_MSFO_LIB_TRN_PL( cntPlogenieCB in varchar2, FlagUpdateNew in  number DEFAULT 1 ) is
+-- обновляем данные о признаке МСФО в таблице lib_trn_pl
+
+
+N number;
+begin
+  
+ UpdTime_LOG (N,'INSERTNEWTRN','обновляем данные о признаке МСФО  в lib_trn_pl');
+
+
+ 
+ merge into (SELECT s.acc_staff --, s.flagmsfo 
+             FROM lib_trn_pl s
+             where s.pologenie_cb=cntPlogenieCB 
+              and s.flag_new_account=FlagUpdateNew ) t
+ using (SELECT a.ACC_2, a.SYMBOLTAIL FROM LIB_MSFO_TRN a )  d
+ on ( substr(t.acc_staff,1,5)=d.ACC_2 and substr(t.acc_staff,14,7) = d.SYMBOLTAIL  )
+ 
+ when matched then
+    update set --t.flagmsfo=1 ;  
+ 
+
+     commit;       
+ UpdTime_LOG (N,'','',0);
+end UPDATE_MSFO_LIB_TRN_PL;*/
+------------------------------------------------------------------------------------------------------------------------------
+
+
+-- обновление данных данными об отделениях в lib_trn_pl_Temp
+procedure UPDATE_OTD_LIB_TRN_PL_TEMP is
+
+N number;
+-- обновление данных данными об отделениях в lib_trn_pl_Temp
+begin 
+  UpdTime_LOG (N,'INSERTNEWTRN','обновление данных данными об отделениях типов транзакций PL');
+     MERGE INTO lib_trn_pl_Temp  t 
+          USING (SELECT s.caccacc, s.cacccur,p.id_otd,p.dacrdate, p.datenext 
+					       FROM lib_acc_bs s,lib_acc_otd_period p where p.id_acc=s.id_acc ) b 
+					   on (t.acc_staff=b.caccacc and t.ctrncur_s=b.cacccur 
+						 and b.dacrdate<=t.DTRNTRAN and b.datenext>t.DTRNTRAN)       
+          
+					WHEN MATCHED THEN--когда совпали , то идет сам update       
+          UPDATE SET t.id_otd=b.id_otd;                      
+    commit;   
+  UpdTime_LOG (N,'','',0);  
+end UPDATE_OTD_LIB_TRN_PL_TEMP;
+------------------------------------------------------------------------------------------------------------------------------
+
+-- обновление данных данными о клиенте и типе клиента
+procedure UPDATE_ATRCUS_LIB_TRN_PL_TEMP is
+-- обновление данных данными о клиенте и типе клиента
+  -- клиента опредеялем по корресподнеции c АСС
+N number;	
+begin   
+   UpdTime_LOG (N,'INSERTNEWTRN','обновление данных данными о клиенте и типе клиента типов транзакций PL');
+      MERGE INTO lib_trn_pl_Temp t 
+              USING (SELECT * FROM lib_acc_bs ) b on  ( t.acc=b.caccacc )       
+              WHEN MATCHED THEN--когда совпали , то идет сам update       
+              UPDATE SET 
+                   t.iacccus=b.iacccus, 
+                   t.ccusflag= b.ccusflag;                      
+        commit;         
+  UpdTime_LOG (N,'','',0); 
+
+end UPDATE_ATRCUS_LIB_TRN_PL_TEMP;
+
+------------------------------------------------------------------------------------------------------------------------------
+
+
+procedure UPDATE_ATRTRN_LIB_TRN_PL_TEMP ( cntPlogenieCB in varchar2  ) is
+-- проводим обновление таблицы lib_trn_pl_Temp статическими кодами типов проводок PL
+N number;	
+begin 
+      UpdTime_LOG (N,'INSERTNEWTRN','обновление таблицы lib_trn_pl_Temp кодами типов проводок lib_trn_pl'); 
+   merge into lib_trn_pl_Temp t
+      using (SELECT k.* FROM lib_trn_pl k where k.Pologenie_CB=cntPlogenieCB) z 
+            on (t.acc_staff =z.acc_staff and  t.ctrncur_s =z.ctrncur_s and  t.acc=z.acc and t.ctrncur_a=z.ctrncur_a )  
+      WHEN MATCHED THEN--когда совпали , то идет сам update       
+              UPDATE SET t.id_type_trn=z.id_type_trn,
+                         t.id_cod_pl=z.id_cod_pl,
+                         t.id_segment=z.id_segment,
+                         t.id_cod_bs=z.id_cod_bs,
+                         t.id_segment_bs=z.id_segment,
+                         --t.flagmsfo=z.flagmsfo,
+                         t.procedureupdate=z.procedureupdate;
+      commit;                
+      UpdTime_LOG (N,'','',0);
+
+end UPDATE_ATRTRN_LIB_TRN_PL_TEMP;
+------------------------------------------------------------------------------------------------------------------------------
+
+procedure UPDATE_ATRLOS_LIB_TRN_PL_TEMP is
+-- проводим обновление таблицы lib_trn_pl_Temp статическими кодами типов проводок списания на убытки
+N number;	
+begin
+UpdTime_LOG (N,'INSERTNEWTRN','обновление таблицы lib_trn_pl_Temp кодами типов проводок lib_trn_losses');
+      merge into lib_trn_pl_Temp t
+      using (SELECT k.* FROM lib_trn_losses k) z 
+            on (t.acc_staff =z.acc_staff and  t.ctrncur_s =z.ctrncur_s and  t.acc=z.acc and t.ctrncur_a=z.ctrncur_a  )  
+      WHEN MATCHED THEN--когда совпали , то идет сам update       
+              UPDATE SET t.id_type_trn=z.id_type_trn,
+                         t.id_cod_pl=z.id_cod_pl,
+                         t.id_segment=z.id_segment,                  
+                         t.procedureupdate=z.procedureupdate;
+      commit;        
+      UpdTime_LOG (N,'','',0);
+
+end UPDATE_ATRLOS_LIB_TRN_PL_TEMP;
+------------------------------------------------------------------------------------------------------------------------------
+
+procedure UPDATE_ATRDIN_LIB_TRN_PL_TEMP( DateBeg in date, DateEnd in date ) is
+ -- уточняем статью PL на динамический параметр - тип клиента 
+ N  number;
+
+begin 
+  
+  
+  UpdTime_LOG (N,'INSERTNEWTRN','уточняем статью PL на динамический параметр - тип клиента  LIB_PODMEN_COD_PL');   
+    
+    merge into lib_trn_pl_Temp t
+    using ( SELECT distinct p.acc,p.ctrncur_a, pp.id_cod_pl_old,  pp.id_cod_pl_new  ,'Аналитическое уточнение LIB_PODMEN_COD_PL'  procedureupdate_new
+                           FROM lib_trn_pl_Temp p, 
+                                    (select b.caccacc,b.cacccur,cl.groupclient 
+                                     FROM groupclient CL, lib_acc_bs b 
+                                     WHERE b.iacccus=CL.id_client 
+                                       and Cl.date_beg<=DateBeg  
+                                       and  Cl.date_end> DateEnd                                        
+                                       and CL.groupclient in ('Корпорат','Крупные','Выделенный клиент') ) Z,
+                                 lib_podmen_cod_pl PP
+                            where  z.groupclient=pp.metka                                  
+                                   and p.acc=z.caccacc 
+                                   and p.ctrncur_a=z.cacccur                                
+                                   and p.id_cod_pl=pp.id_cod_pl_old) d
+                                   
+           on (d.acc=t.acc and d.ctrncur_a=t.ctrncur_a ) 
+    WHEN MATCHED THEN--когда совпали , то идет сам update       
+    UPDATE SET t.id_cod_pl=d.id_cod_pl_new,
+               t.procedureupdate=d.procedureupdate_new
+    where t.id_cod_pl=d.id_cod_pl_old   ;
+                            
+   UpdTime_LOG (N,'','',0);    
+end UPDATE_ATRDIN_LIB_TRN_PL_TEMP;
+
+
+------------------------------------------------------------------------------------------------------------------------------
+
+ 
+procedure UPDATE_DINBS_LIB_TRN_PL_TEMP(DateBeg in date, DateEnd in date ) is
+-- формируем динамические статьи и сегменты кодов BS для корреспондирующего счета. Для применения аналиткорректировок  
+
+ N  number;
+ begin   
+      
+      UpdTime_LOG (N,'INSERTNEWTRN','Динамическое уточнение в PL статьи и сегмента BS  LIB_PODMEN_COD_BS' ); 
+   
+    
+    merge into lib_trn_pl_Temp t
+    using ( SELECT distinct  z.id_segment, pp.id_cod_bs_old,  pp.id_cod_bs_new  ,'Аналитическое уточнение LIB_PODMEN_COD_BS'  procedureupdate_new,
+                    p.id_type_trn    
+            FROM    lib_trn_pl p, 
+                      (select b.caccacc,pd.id_segment,cl.groupclient 
+                      FROM groupclient CL, lib_acc_bs b,lib_acc_bs_period pd
+                      WHERE pd.id_acc=b.id_acc
+                                       and  pd.datenext>DateBeg and pd.dacrdate<=DateBeg
+                                       and b.iacccus=CL.id_client 
+                                       and Cl.date_beg<=DateBeg  
+                                       and Cl.date_end> DateEnd                                        
+                                       and CL.groupclient in ('Корпорат','Крупные','Выделенный клиент') ) Z,
+                                 lib_podmen_cod_bs PP
+             where  z.groupclient=pp.metka                                  
+                    and p.acc=z.caccacc 
+                    and p.id_cod_bs=pp.id_cod_bs_old ) d
+                                   
+           on ( d.id_type_trn=t.id_type_trn ) 
+    WHEN MATCHED THEN--когда совпали , то идет сам update       
+    UPDATE SET t.id_cod_bs=d.id_cod_bs_new,
+               t.id_segment_bs=d.id_segment,
+               t.procedureupdate=d.procedureupdate_new     ;  
+    
+  commit;
+ UpdTime_LOG (N,'','',0); 
+
+
+end UPDATE_DINBS_LIB_TRN_PL_TEMP;
+
+
+------------------------------------------------------------------------------------------------------------------------------
+
+
+procedure  UPD_DinAltCorr_LIB_TRN_PL_TEMP is
+ --     уточнение статьи PL и сегмента по маскам счетов проводок LIB_ANALITCORRECT_COD_PL Применяется в Динамик 
+ N number; 
+ begin 
+  UpdTime_LOG (N,'INSERTNEWTRN','точнение статьи PL и сегмента по маскам счетов проводок LIB_ANALITCORRECT_COD_PL');      
+  FOR ref_cur in    
+              
+   (SELECT * FROM V_LIBANALITCORRECTION_PL  )     --вьюха представление таблицы аналитических подмен
+          
+      loop      
+              
+         if  ref_cur.id_cod_bs is null   then   
+              if not ref_cur.id_cod_pl_old is null then   
+                      if ref_cur.segment_bs is null then                          
+                            update lib_trn_pl_Temp p    
+                            set p.id_cod_pl=ref_cur.id_cod_pl,    
+                                p.procedureupdate='0.Аналитическое уточнение LIB_ANALITCORRECT_COD_PL'    
+                            where p.acc like ref_cur.acca and p.id_cod_pl=ref_cur.id_cod_pl_old;    
+                      else    
+                            update lib_trn_pl_Temp p    
+                            set p.id_cod_pl=ref_cur.id_cod_pl,    
+                                p.id_segment=p.id_segment_bs,    -- (SELECT Acc_Atr_Dinamic (DateEnd,p.acc ,p.idsmr ,p.ctrncur_a,'id_segment')  FROM DUAL t),   
+                                p.procedureupdate='0.Аналитическое уточнение LIB_ANALITCORRECT_COD_PL'      
+                            where p.acc like ref_cur.acca and p.id_cod_pl=ref_cur.id_cod_pl_old;    
+                      end if;                       
+              end if;           
+         else       
+            
+                if not ref_cur.id_cod_pl_old is null then   
+                            if ref_cur.segment_bs is null then    
+                                  update lib_trn_pl_Temp p    
+                                  set p.id_cod_pl=ref_cur.id_cod_pl,    
+                                      p.procedureupdate='1.Аналитическое уточнение LIB_ANALITCORRECT_COD_PL'      
+                                  where p.acc like ref_cur.acca and p.id_cod_pl=ref_cur.id_cod_pl_old and     
+                                        ref_cur.id_cod_bs=p.id_cod_bs;   --(SELECT Acc_Atr_Dinamic (DateEnd,p.acc ,p.idsmr ,p.ctrncur_a, 'id_cod_bs')  FROM DUAL t)  ;     
+                            else    
+                                  update lib_trn_pl_Temp p    
+                                  set p.id_cod_pl=ref_cur.id_cod_pl,    
+                                      p.id_segment=p.id_segment_bs,     --(SELECT Acc_Atr_Dinamic (DateEnd,p.acc ,p.idsmr ,p.ctrncur_a, 'id_segment')  FROM DUAL t),    
+                                      p.procedureupdate='1.Аналитическое уточнение LIB_ANALITCORRECT_COD_PL'      
+                                  where p.acc like ref_cur.acca and p.id_cod_pl=ref_cur.id_cod_pl_old and  p.id_cod_bs=ref_cur.id_cod_bs;    
+                            end if;   
+                                
+                 else               
+                      if ref_cur.segment_bs is null then    
+                                  update lib_trn_pl_Temp p    
+                                  set p.id_cod_pl=ref_cur.id_cod_pl,    
+                                      p.procedureupdate='2.Аналитическое уточнение LIB_ANALITCORRECT_COD_PL'      
+                                  where p.acc like ref_cur.acca  and    
+                                        ref_cur.id_cod_bs=p.id_cod_bs;  --(SELECT Acc_Atr_Dinamic (DateEnd,p.acc ,p.idsmr ,p.ctrncur_a, 'id_cod_bs')  FROM DUAL t)  ;     
+                            else    
+                                  update lib_trn_pl_Temp p    
+                                  set p.id_cod_pl=ref_cur.id_cod_pl,    
+                                      p.id_segment=p.id_segment_bs,    --(SELECT Acc_Atr_Dinamic (DateEnd,p.acc ,p.idsmr ,p.ctrncur_a, 'id_segment')  FROM DUAL t),    
+                                      p.procedureupdate='2.Аналитическое уточнение LIB_ANALITCORRECT_COD_PL'      
+                                  where p.acc like ref_cur.acca and p.id_cod_bs=ref_cur.id_cod_bs ;   
+                            end if;           
+                 end if;    
+          end if;               
+      end loop;   
+    commit;  
+ UpdTime_LOG (N,'','',0); 
+
+end UPD_DinAltCorr_LIB_TRN_PL_TEMP;
+
+
+------------------------------------------------------------------------------------------------------------------------------
+
+
+-- сохраняем данные в хранилище
+procedure  Save_To_PL_TRN ( DateBeg in date, DateEnd in date) is
+-- сохраняем данные в хранилище
+ N number;
+ 
+ 
+ begin 
+   UpdTime_LOG (N,'Save_To_PL_TRN','Удаление данных из хранилища pl_trn');    
+    DELETE FROM PL_TRN t   -- 
+           where t.datetrn between DateBeg and DateEnd-1 
+             --   and t.id_otd in (select y.id_otd from lib_otd y )
+                and not exists (SELECT d.id_type_trn FROM lib_trn_pl_Temp d
+                                   where d.itrnnum=t.itrnnum 
+                                     and d.itrnanum=t.itrnanum 
+                                     and d.id_type_trn=t.id_type_trn                                      
+                                      )    ;
+    commit; 
+    UpdTime_LOG (N,'','',0);
+  
+ UpdTime_LOG (N,'Save_To_PL_TRN','Сохраняем данные в хранилище pl_trn'); 
+     merge into pl_trn t
+      using  lib_trn_pl_Temp d 
+            on (d.itrnnum=t.itrnnum and d.itrnanum=t.itrnanum and d.id_type_trn=t.id_type_trn )  
+      WHEN MATCHED THEN--когда совпали , то идет сам update       
+              UPDATE SET t.datetrn=d.dtrntran,
+                         t.mtrnsum=d.mtrnsum,
+                         t.mtrnrsum=d.mtrnrsum,
+                         t.mtrnsumc=d.mtrnsumc,
+                         t.id_cod_pl=d.id_cod_pl,
+												 t.id_otd=d.id_otd,
+                         t.id_segment=d.id_segment,                        
+                         t.ccusflag=d.ccusflag,
+                         t.procedureupdate=d.procedureupdate
+      WHEN NOT MATCHED THEN
+        insert    (itrnnum, itrnanum,datetrn, mtrnsum,mtrnrsum, mtrnsumc,id_cod_pl, id_segment, id_otd, iacccus,id_type_trn, ccusflag, procedureupdate)
+        values (d.itrnnum,d.itrnanum, d.dtrntran,d.mtrnsum,d.mtrnrsum, d.mtrnsumc,d.id_cod_pl,d.id_segment,d.id_otd, d.iacccus, d.id_type_trn,d.ccusflag,d.procedureupdate );
+         -- отделения пишутся только при вервой загрузке                
+      commit;      
+ 
+   
+ UpdTime_LOG (N,'','',0); 
+
+end Save_To_PL_TRN;
+
+------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+procedure Update_LIB_TRN_PL( DateBeg in date,cntPlogenieCB in varchar2,  FlagUpdateNew in  number DEFAULT 1 ) is
+
+-- ОБНОВЛЕНИЕ ТИПОВ ТРАНЗАКЦИЙ В lib_trn_pl. Сборка
+
+
+
+begin
+  
+  
+  -- заносим новые символы в библиотеку LIB_PL с ID_COD_PL=300 и ID_SEGMENT=2
+    pl_create.INS_NEW_Symb_LIB_PL ( cntPlogenieCB,FlagUpdateNew);
+     
+  -- обновляем типы транзакций кодами и сегментами  'Первичная кодировка PL'
+   pl_create.UPDATE_CODPL_SEGM_LIB_TRN_PL (DateBeg,cntPlogenieCB,FlagUpdateNew);
+ 
+ -- уточнение статьи PL по ипотечным проводкам 
+  --  pl_create.UPDATE_IPOTEKA_LIB_TRN_PL(cntPlogenieCB,FlagUpdateNew);
+  
+ 
+ -- обновляем данные о статье BS в таблице lib_trn_pl
+    pl_create.UPDATE_CODBS_LIB_TRN_PL(DateBeg,cntPlogenieCB, FlagUpdateNew);
+ 
+ if FlagUpdateNew=1 then   
+    update lib_trn_pl p set p.flag_new_account=0  where p.flag_new_account=1 and  p.id_cod_pl!=300; 
+ end if;
+ 
+ commit; 
+  
+end Update_LIB_TRN_PL;
+
+
+------------------------------------------------------------------------------------------------------------------------
+
+procedure INSERT_TRN_PL_TO_Temp (DateBeg in date, DateEnd in date) is
+  -- вставляем все проводки за период во врменную таблицу по счетам зарегистрированным в  lib_acc_bs
+N number;
+ss number;
+vDateEnd date;
+
+begin 
+	
+  execute immediate 'truncate table  lib_trn_pl_Temp'; 
+  commit; 
+  
+  select 1/86400 into ss from dual;
+  vDateEnd:= DateEnd-ss;
+	
+ -- вставляем все проводки за период во врменную таблицу по счетам зарегистрированным в  lib_acc_bs
+  UpdTime_LOG (N,'INSERTNEWTRN','insert into lib_trn_pl_Temp');
+  insert /*+ APPEND */  into lib_trn_pl_Temp (ITRNNUM,Itrnanum,Dtrntran, Acc_Staff,Ctrncur_s,Acc,Ctrncur_a,MTRNSUM,MTRNRSUM,MTRNSUMC,Ctrnpurp ) 
+      (SELECT DISTINCT  N.ITRNNUM,N.Itrnanum,N.Dtrntran,N.ACC_STAFF , N.ctrncur_s , N.ACC , N.ctrncur_a , N.MTRNSUM,N.MTRNRSUM,N.MTRNSUMC,N.CTRNPURP		
+      
+       FROM         
+           (  SELECT distinct t.ITRNNUM,t.Itrnanum,to_char(t.DTRNTRAN) DTRNTRAN, t.CTRNACCD AS ACC_STAFF, t.CTRNCUR as ctrncur_s , t.CTRNACCC AS ACC, t.CTRNCURC as ctrncur_a,t.IDSMR,
+                        -t.MTRNSUM as MTRNSUM ,-t.MTRNRSUM as MTRNRSUM ,-t.MTRNSUMC as MTRNSUMC, t.CTRNPURP   
+              FROM xxi."trn" t 
+                where t.DTRNTRAN between DateBeg and vDateEnd 
+                     and (substr(t.CTRNACCD,1,3)='706' 
+                     and  substr(t.CTRNACCC,1,3)!='707'
+										 and not (t.ITRNBA2D in (70601,70603,70606,70608)  and t.ITRNBA2C in (30305,30306) and t.CTRNCURC='RUR')   --исключаем из оборотов межфилиальные обороты   									 
+										 )    
+                  
+               union
+
+             SELECT distinct t.ITRNNUM,Itrnanum,to_char(t.DTRNTRAN) DTRNTRAN, t.CTRNACCC  AS ACC_STAFF , t.CTRNCURC as ctrncur_s, t.CTRNACCD  AS ACC, t.CTRNCUR ctrncur_a, t.IDSMR, 
+                      t.MTRNSUM,t.MTRNRSUM,t.MTRNSUMC, t.CTRNPURP  
+             FROM xxi."trn" t 
+             where t.DTRNTRAN between DateBeg and vDateEnd                 
+                   and  (substr(t.CTRNACCC,1,3)='706' 
+                   and  substr(t.CTRNACCD,1,3)!='707')									 
+									 and not (t.ITRNBA2D in (30305,30306) and t.CTRNCUR='RUR' and t.ITRNBA2C in (70601,70603,70606,70608)) --исключаем из оборотов межфилиальные обороты 	
+           ) N 
+      
+    where    exists (SELECT * FROM lib_acc_bs b where b.caccacc=n.ACC_STAFF  and b.cacccur=n.ctrncur_s  ) 
+       and   exists (SELECT * FROM lib_acc_bs b where b.caccacc=n.ACC and b.cacccur=n.ctrncur_a  ) 
+           );
+ commit;
+ UpdTime_LOG (N,'','',0);   
+
+end INSERT_TRN_PL_TO_Temp;
+-----------------------------------------------------------------------------------------------------------------------
+
+
+procedure INSERT_NEW_TO_LIB_TRN_PL (cntPlogenieCB in varchar2) is
+  -- вставка новых типов транзакций о прибылях и убытках PL в  lib_trn_pl, прикручиваем признак МСФО проводки 
+N number;
+begin 
+
+ 
+  UpdTime_LOG (N,'INSERTNEWTRN','вставка новых типов транзакций PL');
+      insert /*+ APPEND */ into lib_trn_pl 
+              (acc_staff, ctrncur_s, acc, ctrncur_a,id_cod_pl, id_segment,
+               procedureupdate, id_cod_bs,id_segment_bs,pologenie_cb,id_type_trn,flag_new_account,symboltail,dateupdate,dacrdate)
+         
+     
+		 SELECT Z.acc_staff,Z.ctrncur_s, Z.acc,z.ctrncur_a, 300 as id_cod_pl, 2 as id_segment,'Первичная кодировка PL' as procedureupdate,
+                 138 as id_cod_bs, 2 as id_segment_bs,cntPlogenieCB as pologenie_cb,id_type_trn.nextval, 1,substr(ACC_STAFF,14,7),  trunc(sysdate),  
+                 trunc(sysdate-30, 'YYYY')  
+		 
+		 FROM(select distinct n.acc_staff, n.ctrncur_s, n.acc,n.ctrncur_a, n.idsmr
+      FROM lib_trn_pl_Temp n
+      where  substr(n.ACC_STAFF,1,1)='7' and
+             not exists (SELECT pl.ACC_STAFF FROM lib_trn_pl pl where pl.ACC_STAFF=n.ACC_STAFF and pl.ctrncur_s=n.ctrncur_s and
+                                pl.ACC =n.ACC and pl.ctrncur_a=n.ctrncur_a and pl.pologenie_cb=cntPlogenieCB ) 
+       ) Z; 
+   commit;  
+      
+  UpdTime_LOG (N,'','',0);
+
+end INSERT_NEW_TO_LIB_TRN_PL;
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------------
+
+procedure INSERT_TRN_LOSSES_TO_Temp (DateBeg in date, DateEnd in date) is
+      -- вставляем в таблицу lib_trn_pl_Temp проводки Списания на убытки 
+      
+N number;
+ss number;
+vDateEnd date;  
+begin
+
+select 1/86400 into ss from dual;
+vDateEnd:= DateEnd-ss;
+
+ UpdTime_LOG (N,'INSERTNEWTRN','Отбираем проводки Списания на убытки в lib_trn_pl_Temp');
+ insert /*+ APPEND */ into lib_trn_pl_Temp ( ITRNNUM,Itrnanum,Dtrntran, Acc_Staff,Ctrncur_s,Acc,Ctrncur_a,MTRNSUM,MTRNRSUM,MTRNSUMC,
+                                                    Id_Cod_Pl,Id_Segment,Iacccus,Ccusflag,Procedureupdate ) 
+       (SELECT N.ITRNNUM,N.Itrnanum,N.Dtrntran,N.ACC_STAFF,N.ctrncur_s, N.ACC , N.ctrncur_a , N.MTRNSUM,N.MTRNRSUM,N.MTRNSUMC, N.id_cod_pl,N.id_segment,
+                        bs.iacccus ,
+                        bs.ccusflag,
+                        'Первичная кодировка PL' as procedureupdate                   
+       FROM lib_acc_bs bs INNER JOIN
+            (SELECT distinct t.ITRNNUM,t.Itrnanum,to_char(t.DTRNTRAN) DTRNTRAN, t.CTRNACCD AS ACC_STAFF, t.CTRNCUR as ctrncur_s , t.CTRNACCC AS ACC, t.CTRNCURC as ctrncur_a,t.IDSMR,
+                 -t.MTRNSUM as MTRNSUM ,-t.MTRNRSUM as MTRNRSUM ,-t.MTRNSUMC as MTRNSUMC,
+                  pl.id_cod_pl, 2 as id_segment  
+             from xxi."trn" t,lib_losses_pl pl 
+						 where substr(t.CTRNACCD,1,3)= pl.caccacc_lown  and  t.ITRNBA2C= pl.caccacc_reserve 
+                   and t.DTRNTRAN between DateBeg and vDateEnd                   
+              union                   
+             SELECT distinct t.ITRNNUM,Itrnanum,to_char(t.DTRNTRAN) DTRNTRAN, t.CTRNACCC  AS ACC_STAFF , t.CTRNCURC as ctrncur_s, t.CTRNACCD  AS ACC, t.CTRNCUR ctrncur_a, t.IDSMR, 
+                        t.MTRNSUM,t.MTRNRSUM,t.MTRNSUMC,
+                  pl.id_cod_pl, 2 as id_segment    
+             from xxi."trn" t,lib_losses_pl pl
+             where  substr(t.CTRNACCC,1,3)= pl.caccacc_lown  
+                  and t.ITRNBA2D= pl.caccacc_reserve
+                  and t.DTRNTRAN between DateBeg and vDateEnd  ) N
+       on bs.caccacc=N.ACC_STAFF and bs.cacccur=N.ctrncur_s        
+       where    exists (SELECT * FROM lib_acc_bs b where b.caccacc=n.ACC_STAFF  and b.cacccur=n.ctrncur_s ) 
+                and exists (SELECT * FROM lib_acc_bs b where b.caccacc=n.ACC and b.cacccur=n.ctrncur_a )      );    
+   commit;  
+  UpdTime_LOG (N,'','',0);
+  
+
+
+end INSERT_TRN_LOSSES_TO_Temp;
+
+---------------------------------------------------------------------------------------------------------------------------
+-- вставляем в таблицу lib_trn_losses новые типы проводок Списания на убытки 
+procedure INSERT_NEW_TO_LIB_TRN_LOSSES   is
+    -- вставляем в таблицу lib_trn_losses новые типы проводок Списания на убытки 
+      
+N number;  
+begin
+  
+UpdTime_LOG (N,'INSERTNEWTRN','Обновляем таблицу Списания на убытки типами проводок');
+     insert /*+ APPEND */  into lib_trn_losses (acc_staff,ctrncur_s,acc,ctrncur_a,id_cod_pl,id_segment, id_type_trn,dacrdate,dateupdate)     
+    
+     select N.*,id_type_trn.nextval as id_type_trn,to_date('01.01.2017','dd.mm.yyyy'), trunc(sysdate)
+      FROM 
+        (SELECT distinct t.ACC_STAFF, t.ctrncur_s,t.ACC, t.ctrncur_a,t.id_cod_pl, t.id_segment 
+         from lib_trn_pl_Temp t,lib_losses_pl l 
+         where substr(t.ACC_STAFF,1,3)= l.caccacc_lown  and substr(t.acc,1,5)= l.caccacc_reserve       
+          ) N
+    where   not exists (SELECT pl.ACC_STAFF FROM LIB_TRN_LOSSES pl 
+                         where pl.acc_staff=n.ACC_STAFF and pl.ctrncur_s=n.ctrncur_s  and pl.ACC =n.ACC and pl.ctrncur_a=n.ctrncur_a)      
+      ;        
+   commit;
+ UpdTime_LOG (N,'','',0);  
+
+end INSERT_NEW_TO_LIB_TRN_LOSSES;
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------
+procedure INSERTNEWTRN(DateBeg in date, DateEnd in date, FlagUpdateNew in  number  ) is
+-- вставка новых типов транзакций в lib_trn_pl, расскрасска статистическими данными транзакций
+--обновление бибдиотек в рамках одного года
+-- обновление транзакции в рамках одного месяца 
+
+cntPlogenieCB nvarchar2(100);
+
+begin 
+ -- определяем действующее положение ЦБ 
+if DateBeg<to_date('01.01.2016','dd.mm.yyyy') and DateEnd<=to_date('01.01.2016','dd.mm.yyyy') then   
+   cntPlogenieCB:='385-П';
+else  
+   cntPlogenieCB:='446-П';
+end if; 
+
+ -- подключаем окружение
+ --idsmr_switch(cIDSMR);   
+ 
+ -- PL
+ -- вставляем все проводки за период во врменную таблицу по счетам зарегистрированным в  lib_acc_bs
+ pl_create.INSERT_TRN_PL_TO_Temp (DateBeg,DateEnd);
+    
+ -- вставка новых типов транзакций о прибылях и убытках PL в  lib_trn_pl
+ pl_create.INSERT_NEW_TO_LIB_TRN_PL(cntPlogenieCB); 
+     
+ -- расскрашиваем библиотеку типов транзакций кодами PL      
+ pl_create.Update_LIB_TRN_PL (DateBeg,cntPlogenieCB,FlagUpdateNew);
+  
+  
+  
+  --LOSSES
+  -- вставляем в таблицу lib_trn_pl_Temp проводки Списания на убытки 
+   pl_create.INSERT_TRN_LOSSES_TO_Temp(DateBeg,DateEnd); 
+  -- вставляем в таблицу lib_trn_losses новые типы проводок Списания на убытки 
+   pl_create.INSERT_NEW_TO_LIB_TRN_LOSSES ; 
+  
+  
+  
+  -- ЗАВЕРШЕНИЕ  РАССКРАСКИ  LIB_TRN_PL_TEMP
+
+     -- проводим обновление таблицы lib_trn_pl_Temp статическими кодами типов проводок
+      pl_create.UPDATE_ATRTRN_LIB_TRN_PL_TEMP (cntPlogenieCB);
+      
+      -- уточнение статьи PL по ипотечным проводкам  Делаем каждый раз 
+      pl_create.UPDATE_IPOTEKA_LIB_TRN_PL_TEMP (DateBeg);	
+       
+       
+    	
+    	   
+      -- проводим обновление таблицы lib_trn_pl_Temp статическими кодами типов проводок списания на убытки
+      pl_create.UPDATE_ATRLOS_LIB_TRN_PL_TEMP ;
+    	 
+       -- обновление данных данными об отделениях
+      pl_create.UPDATE_OTD_LIB_TRN_PL_TEMP  ;
+    	 
+    	   
+      -- обновление данных данными о клиенте и типе клиента
+      -- клиента опредеялем по корресподнеции c АСС
+      pl_create.UPDATE_ATRCUS_LIB_TRN_PL_TEMP;   	
+
+		
+		
+		
+		
+ 
+ --УТОЧНЕНИЕ СТАТЕЙ НА ДИНАМИЧЕСКИЙ ХАРАКТЕР ДАННЫХ И ЗАПИСЬ РАССКРАШЕННЫХ ПРОВОДОК В ХРАНИЛИЩЕ
+ 
+  -- формируем статьи кодов BS для корреспондирующего счета. Для применения аналиткорректировок  
+  
+  
+  -- динамические статьи и сегменты BS 
+    pl_create.UPDATE_DINBS_LIB_TRN_PL_TEMP (DateBeg,DateEnd); 
+	
+	
+--     уточнение статьи PL и сегмента по маскам счетов проводок LIB_ANALITCORRECT_COD_PL Применяется в Динамик  
+  pl_create.UPD_DinAltCorr_LIB_TRN_PL_TEMP;
+	
+  
+  -- уточняем статью PL на динамический параметр - тип клиента lib_podmen_cod_pl  'Корпорат,Крупные,Выделенный клиент'
+  pl_create.UPDATE_ATRDIN_LIB_TRN_PL_TEMP(DateBeg, DateEnd); 
+	  
+	 
+        
+end INSERTNEWTRN;
+
+
+
+----------------------------------------------------------------------------------------------------------------------------------
+
+
+procedure Load_PL_TRN( DateBeg in date, DateEnd in date)  is
+-- запись данных о проводках в хранилище за период кратно месяцу иди меньше
+
+cntDateBeg date;
+cntDateEnd date;
+I number ;
+ 
+begin   
+ I:=0;
+ cntDateBeg:=DateBeg;  
+ 
+ -- trunc (DateBeg, 'MM') Первый день месяца
+
+ if  trunc (DateBeg, 'MM')= trunc (DateEnd-1, 'MM') then
+   -- DateBeg и DateEnd-1 одного месяца                     
+                 cntDateEnd :=DateEnd;
+                 pl_create.INSERTNEWTRN (cntDateBeg,cntDateEnd,1);
+                 pl_create.Save_To_PL_TRN (cntDateBeg,cntDateEnd );
+                 bs_msfo_create.Update_PL_TRN_MSFO_TRN(cntDateBeg,cntDateEnd);   --обновляем поле - флаг корректировок МСФО в таблице PL_TRN      
+                                             
+ else
+ 
+         loop        
+               -- Последний день месяца
+               cntDateEnd := trunc (last_day(cntDateBeg))+1;  
+               if cntDateEnd > DateEnd then   cntDateEnd:= DateEnd ;  end if;
+                pl_create.INSERTNEWTRN (cntDateBeg,cntDateEnd,1);                               
+               
+               -- сохраняем данные в хранилище в динамической расскраске.             
+                 pl_create.Save_To_PL_TRN (cntDateBeg,cntDateEnd); 
+                 bs_msfo_create.Update_PL_TRN_MSFO_TRN(cntDateBeg,cntDateEnd);   --обновляем поле - флаг корректировок МСФО в таблице PL_TRN              
+                 
+                  cntDateBeg:= cntDateEnd;                    
+                  exit when cntDateEnd= DateEnd ;   
+                  I:=I+1;         
+          end loop;   
+
+ end if;  
+
+ 
+
+
+end Load_PL_TRN;
+
+--------------------------------------------------------------------------------------------------------------
+
+
+procedure ReUpdate_IACCUS_CCUSFLAG  IS
+  -- шаг обновления номера клиента  проводится в BS_CREATE при обновлении таблицы LIB_ACC_BS
+begin  
+  merge into pl_trn z
+  using (select  distinct p.id_type_trn ,  b.iacccus, b.ccusflag
+         from pl_trn t, lib_trn_pl p, lib_acc_bs b 
+         where t.id_type_trn=p.id_type_trn and  b.caccacc=p.acc and b.iacccus!=t.iacccus) g
+   on (g.id_type_trn=z.id_type_trn ) 
+  when matched then
+      update set
+                      z.iacccus=g.iacccus,
+                      z.ccusflag=g.ccusflag; 
+                      
+        
+       commit;      
+            
+    UpdTime_LOG (N,'','',0);
+                      
+                      
+                                       
+end ReUpdate_IACCUS_CCUSFLAG;
+
+
+----------------------------------------------------------------------------------------------------
+-- переносим данные во временную таблицу PL за период для расшифровки PL
+procedure Rashifrovka_PL(DateBeg in date, Datend in date,
+                         cCOD_PL in varchar2 default null,
+                         cid_segment in varchar2 default null,
+                         cid_otd in  varchar2 default null,                        
+                         cIDccusflag in varchar2 default null)  is
+                         
+-- переносим данные во временную таблицу PL за период для расшифровки PL
+
+DateEnd_1 date;
+tblID_COD number_array;
+tblID_SEGMENT number_array;
+tblID_OTD number_array;
+tblIDccusflag number_array;
+
+
+begin
+ execute immediate 'truncate table lib_trn_pl_Temp';
+
+DateEnd_1:=Datend-1;
+
+execute immediate 'truncate table temp_param';
+ 
+tblID_COD:= pk_array_id.Array_id_cod_PL(cCOD_PL); 
+ insert into temp_param(id_cod_pl) 
+ select * from table(tblID_COD);
+ commit; 
+   
+tblID_SEGMENT:=pk_array_id.Array_id_segment(cID_SEGMENT);
+ insert into temp_param(id_segment) 
+ select * from table(tblID_SEGMENT);
+ commit;
+
+tblID_OTD:=pk_array_id.Array_id_OTD (cID_OTD);
+insert into temp_param(id_otd) 
+select * from table(tblID_OTD);
+commit;
+
+tblIDccusflag:=pk_array_id.Array_id_Dccusflag (cIDccusflag);
+insert into temp_param(ccusflag) 
+select * from table(tblIDccusflag);
+commit;
+
+
+
+INSERT INTO lib_trn_pl_Temp (Itrnnum,Itrnanum,Dtrntran, Id_Cod_Pl,Id_Segment,MTRNRSUM,Procedureupdate,
+                             Id_Otd,Iacccus,Ccusflag,Ctrnpurp,flagmsfo,Fio_User,Pod_Into)
+        SELECT  t.Itrnnum,t.Itrnanum,t.datetrn, t.Id_Cod_Pl,t.Id_Segment,t.MTRNRSUM,t.Procedureupdate,t.Id_Otd,t.Iacccus,t.Ccusflag,
+        t.Ctrnpurp, 
+        t.flagmsfo,
+        t.fio_user,
+        t.Pod_into
+        FROM V_PL_TRN t 
+        WHERE t.datetrn between DateBeg and DateEnd_1          
+              and t.ID_COD_PL in (select z.id_cod_pl from temp_param z)
+              and t.ID_SEGMENT in (select z.id_segment from temp_param z)
+              and t.ID_OTD in (select z.id_otd from temp_param z) 
+              and t.CCUSFLAG in (select z.ccusflag from temp_param z)
+ ;
+ 
+ 
+ 
+ commit;
+ 
+ 
+                                
+end Rashifrovka_PL;
+
+--------------------------------------------------------------------------------------------------------------
+-- выборка детализированной информации по проводке
+procedure TransactionFullInfo(DateBeg in date, Datend in date,
+                               mask_DT in varchar2 ,
+                               mask_KT in varchar2)  is
+                         
+-- выборка детализированной информации по проводке
+
+
+
+begin
+ execute immediate 'truncate table lib_trn_pl_Temp';
+ commit;
+
+   
+      
+
+INSERT INTO lib_trn_pl_Temp (Itrnnum,Itrnanum,ITRNTYPE,ITRNSOP,ITRNDOCNUM,DTRNDOC,DTRNTRAN, ACC_STAFF, ACC,  MTRNSUM,MTRNSUMC,MTRNRSUM,  CTRNPURP,
+                              CACCNAME_STAFF,Iacccusname_Staff, otdname_STAFF,  CACCNAME_ACC,Iacccusname_Acc, otdname_ACC, CTRNCUR_S,  CTRNCUR_A,
+                              Iacccus_Acc_Staff,Iacccus_Acc  )
+     select 
+       n.ITRNNUM,
+       n.ITRNANUM,
+       
+       n.ITRNTYPE,
+       n.ITRNSOP, 
+       n.ITRNDOCNUM,
+       n.DTRNDOC,
+       
+       trunc(n.DTRNTRAN) as DTRNTRAN,             
+       n.CTRNACCD,
+       n.CTRNACCC,
+      
+       n.MTRNSUM as MTRNSUM_DT,
+       n.MTRNSUMC as MTRNSUM_KT,
+       n.MTRNRSUM,
+       
+       n.CTRNPURP,
+       
+       c_dt.CACCNAME as CACCNAME_DT , 
+       c_dt.ccusname_sh as ccusname_DT,
+       c_dt.COTDNAME as otd_DT, 
+       
+       c_kt.CACCNAME as CACCNAME_KT , 
+       c_kt.ccusname_sh as ccusname_KT,
+       c_kt.COTDNAME as otd_KT, 
+       
+     --  n.ITRNBA2D,
+     --  n.ITRNBA2C,
+     --  SUBSTR(n.CTRNACCD,14,7) as Symbol_DT, 
+   --    SUBSTR(n.CTRNACCC,14,7) as Symbol_KT,
+       
+   --    SUBSTR(n.CTRNACCD,6,3) as Valuta_DT,
+       n.CTRNCUR as CTRNCUR_DT,
+       
+   --    SUBSTR(n.CTRNACCC,6,3) as Valuta_KT,
+       n.CTRNCURC as CTRNCUR_KT,
+       
+       c_dt.icusnum,  
+       c_kt.icusnum
+       
+FROM xxi."trn" n , 
+   
+   (select a.CACCACC, a.CACCNAME, c.ccusname_sh,  o.COTDNAME$ as COTDNAME, c.icusnum  
+    from xxi."acc" a, xxi."cus" c, xxi."otd" o 
+    where  a.IACCCUS=c.icusnum and o.IOTDNUM=a.IACCOTD and o.IDSMR=a.IDSMR )  c_dt,
+   
+   (select a.CACCACC, a.CACCNAME, c.ccusname_sh, o.COTDNAME$ as COTDNAME, c.icusnum   
+    from xxi."acc" a, xxi."cus" c, xxi."otd" o 
+    where  a.IACCCUS=c.icusnum and o.IOTDNUM=a.IACCOTD and o.IDSMR=a.IDSMR) c_kt
+
+where  c_dt.CACCACC=n.CTRNACCD 
+   and c_kt.CACCACC=n.CTRNACCC
+   and n.DTRNTRAN between DateBeg and Datend-1/86400
+   and  ( ( n.CTRNACCD like mask_DT and n.CTRNACCC like mask_KT) or 
+          ( n.CTRNACCC like mask_DT and n.CTRNACCD like mask_KT))
+ ;
+ 
+ commit;
+ 
+ --обезличивание данных 
+ update lib_trn_pl_Temp z set z.caccname_staff=null,
+                              z.iacccusname_staff=null,
+                              z.ctrnpurp=null
+ where
+   not exists  (select  1  from V_IS_DETAIL_INFO t, Lib_Cod_Bs  b, lib_acc_bs s, lib_acc_bs_period p 
+                                              where s.id_acc=p.id_acc and p.id_cod_bs=b.id_cod_bs
+                                                and b.cod_bs=t.value and t.objectname='LIB_COD_BS.COD_BS' 
+                                                and t.login_ad = SYS_CONTEXT ( 'userenv', 'OS_USER' )
+                                                and z.acc_staff=s.caccacc );
+  commit;
+  
+
+ --обезличивание данных 
+ update lib_trn_pl_Temp z set z.CACCNAME_ACC=null,
+                              z.iacccusname_acc=null,
+                              z.ctrnpurp=null
+ where
+   not exists  (select  1  from V_IS_DETAIL_INFO t, Lib_Cod_Bs  b, lib_acc_bs s, lib_acc_bs_period p 
+                                              where s.id_acc=p.id_acc and p.id_cod_bs=b.id_cod_bs
+                                                and b.cod_bs=t.value and t.objectname='LIB_COD_BS.COD_BS' 
+                                                and t.login_ad = SYS_CONTEXT ( 'userenv', 'OS_USER' )
+                                                and z.ACC=s.caccacc );
+  commit; 
+  
+                                                 
+                                
+end TransactionFullInfo;
+
+--------------------------------------------------------------------------------------------------------------
+
+
+procedure Insert_PL_TEMP(DateBeg in date, Datend in date,
+                         cCOD_PL in varchar2 default null,
+                         cid_segment in varchar2 default null,
+                         cid_otd in  varchar2 default null,                        
+                         cIDccusflag in varchar2 default null)  is
+-- переносим данные во временную таблицу PL за период для отчета  PL
+
+DateEnd_1 date;
+tblID_COD number_array;
+tblID_SEGMENT number_array;
+tblID_OTD number_array;
+tblIDccusflag number_array;
+
+
+begin
+ execute immediate 'truncate table lib_trn_pl_Temp';
+
+DateEnd_1:=Datend-1;
+ 
+execute immediate 'truncate table temp_param';
+ 
+tblID_COD:= pk_array_id.Array_id_cod_PL(cCOD_PL); 
+ insert into temp_param(id_cod_pl) 
+ select * from table(tblID_COD);
+ commit; 
+   
+tblID_SEGMENT:=pk_array_id.Array_id_segment(cID_SEGMENT);
+ insert into temp_param(id_segment) 
+ select * from table(tblID_SEGMENT);
+ commit;
+
+tblID_OTD:=pk_array_id.Array_id_OTD (cID_OTD);
+insert into temp_param(id_otd) 
+select * from table(tblID_OTD);
+commit;
+
+tblIDccusflag:=pk_array_id.Array_id_Dccusflag (cIDccusflag);
+insert into temp_param(ccusflag) 
+select * from table(tblIDccusflag);
+commit;
+  
+  
+  
+  
+ if  cCOD_PL  is null and cid_segment is null and cid_otd is null and cIDccusflag is null then
+  INSERT INTO lib_trn_pl_Temp (Id_Cod_Pl,Id_Segment,Id_otd,Ccusflag,flagmsfo, MTRNRSUM)
+        (SELECT distinct t.id_cod_pl,t.id_segment,t.id_otd,t.Ccusflag, t.flagmsfo,  sum(t.MTRNRSUM) as rub 
+  FROM V_PL_TRN t
+  WHERE t.datetrn between DateBeg and DateEnd_1       
+  GROUP BY t.id_cod_pl,t.id_segment,t.id_otd,t.Ccusflag, t.flagmsfo)        
+      ;  
+ 
+          
+  else
+    INSERT INTO lib_trn_pl_Temp (Id_Cod_Pl,Id_Segment,Id_otd,flagmsfo,MTRNRSUM)
+        (SELECT distinct t.id_cod_pl,t.id_segment,t.id_otd, t.flagmsfo,  sum(t.MTRNRSUM) as rub 
+        FROM V_PL_TRN t 
+        WHERE t.datetrn between DateBeg and DateEnd_1
+          and t.ID_COD_PL in (select z.id_cod_pl from temp_param z)
+              and t.ID_SEGMENT in (select z.id_segment from temp_param z)
+              and t.ID_OTD in (select z.id_otd from temp_param z) 
+              and t.CCUSFLAG in (select z.ccusflag from temp_param z)
+            
+        GROUP BY t.id_cod_pl,t.id_segment,t.id_otd, t.flagmsfo)        
+        ;  
+  
+  end if;
+  
+ commit; 
+
+end Insert_PL_TEMP;
+
+------------------------------------------------------------------------------------------
+
+
+procedure CurPL(DateBeg in date, Datend in date,ref_curPL out sys_refcursor)  is
+-- курсор агрегат PL за период
+
+DateEnd_1 date;
+
+begin
+   DateEnd_1:=Datend-1;
+ 
+  open ref_curPL for
+    SELECT distinct t.id_cod_pl,t.id_segment,t.id_otd,t.ccusflag, t.flagmsfo,  sum(t.mtrnrsum) as rub 
+    FROM V_PL_TRN t 
+    WHERE t.datetrn between DateBeg and DateEnd_1
+    GROUP BY t.id_cod_pl,t.id_segment,t.id_otd,t.ccusflag, t.flagmsfo;   
+ commit; 
+
+end CurPL;
+
+
+
+
+
+
+
+--begin
+  -- Initialization
+  
+ --  execute immediate 'begin XXI.XXI_CONTEXT.SET_IDSMR ('||cIDSMR||'); end;'; 
+   
+  -- if DateEnd<=to_date('01.01.2016','dd.mm.yyyy') then   
+  --     cntPlogenieCB:='385-П';
+ --  else
+  --    cntPlogenieCB:='446-П';
+ --  end if;
+  --<Statement>;
+end PL_create;
