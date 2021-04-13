@@ -1,0 +1,520 @@
+create or replace package body MTL is
+
+--основной блок обработки MTL
+procedure Main_Load_MTL(start_date in date, end_date in date) is
+begin
+  
+  --обновляем таюлицу-сравочник с диапазонами карт, bin_len и типом продукта 
+  MTL.ImportInto_MTL_CTL_BINTAB;
+  --очищаем перегружаемые данные
+  MTL.ClearMTLData(start_date, end_date);
+  --основная процедура по обезличиванию номера карты, присваивания продукта карте и сохранение операции в основную таблицу MTL_DATA
+  MTL.load_MTL(start_date, end_date);
+  
+end Main_Load_MTL;  
+
+--заполнение таблицы MTL_CTL_BINTAB корректными диапазонами номеров карт.
+
+procedure ImportInto_MTL_CTL_BINTAB is
+  
+begin
+  
+  execute immediate 'truncate table MTL_CTL_BINTAB';
+  
+  insert into MTL_CTL_BINTAB (CARDNUMBER_TYPE, START_BIN, END_BIN, CODE_A3, BIN_LEN, PRODUCT_ID)
+  select (case when PS = 'MC'then 'MASTERCARD' 
+             when PS = 'VISA'then 'VISA'
+             when PS = 'MIR' then 'МИР'
+        end ) as PS,
+        to_number(BIN_START) as BIN_START,
+        to_number(BIN_END) as BIN_END,
+        trim(CODE_A3), BIN_LEN, trim(PRODUCT_ID)
+  from kk_xxi.kk_bintab; 
+  
+  commit;
+  
+--на основании MTL_CTL_BINTAB строим FULL таблицу из диапазонов  (внимание - COST операции высокая далее не используется)
+
+/*
+for mtl_bin in (select CARDNUMBER_TYPE, START_BIN, END_BIN, CODE_A3, BIN_LEN, PRODUCT_ID from MTL_BINTAB)
+loop
+  crd_type := mtl_bin.CARDNUMBER_TYPE;
+  st_bin := mtl_bin.START_BIN;
+  end_bin := mtl_bin.END_BIN;
+  cd_a3 := mtl_bin.CODE_A3;
+  b_len := mtl_bin.BIN_LEN;
+  prdt_id := mtl_bin.PRODUCT_ID;
+  
+  nums_iter := 0;
+  nums_max := end_bin - st_bin;
+  
+  loop
+    insert into mtl_bintab_full(CARDNUMBER_TYPE, CARDNUMBER, CODE_A3, BIN_LEN, PRODUCT_ID)
+    values (crd_type, st_bin + nums_iter, cd_a3, b_len, prdt_id);
+    nums_iter := nums_iter + 1;      
+    exit when nums_iter > nums_max;
+  end loop;
+  
+  commit;
+    
+end loop;
+*/
+  
+end ImportInto_MTL_CTL_BINTAB;
+
+--очистка перегружаемых данных таблицы MTL_DATA
+procedure ClearMTLData(start_date in date, end_date in date) is
+begin
+  delete from MTL_DATA where date_file_load between start_date and end_date;
+  commit;
+end ClearMTLData;
+
+
+
+--основная процедура по обезличиванию номера карты в операции и присвоению операции продукта для MTL
+procedure load_MTL(date_beg in date, date_end in date) is
+
+begin
+  
+-- подготовка обрабатываемых операций;
+execute immediate 'truncate table MTL_CTL_TEMP';
+
+insert into MTL_CTL_TEMP (ID_FILE,
+                          NAME_FILE,
+                          DATE_FILE_LOAD,
+                          NUM_LINE_IN_FILE,
+                          DATA_STR,
+                          SUM_PROFIT,
+                          TRANSACTIONNUMBER,
+                          FULL_CARDNUMBER19,
+                          CORRESPONDINGACCOUNT,
+                          CARDNUMBER_TYPE)
+
+select data.id_file,
+       data.name_file,
+       data.date_file_load,
+       data.num_line_in_file,
+       data.data_str,
+       data.sum_profit,
+       data.TransactionNumber,
+       data.Full_CardNumber19,
+       data.CorrespondingAccount,
+       upper(trim(nvl(ca.cardnumber_type, ca.correspondingaccount_val))) as CardNumber_Type
+from
+(       
+select plf.ifileinid as id_file,               -- ИД файла
+           plf.cfileinname as name_file,           -- Имя файла
+             plf.dfileinload as date_file_load,      -- Дата загрузки
+             plf_r.irawline as num_line_in_file,     -- Номер строки
+             --plf_r.crawstr as data_str,              -- Строка файла -- необходимо вырезать
+             -- шифруем PAN в операции
+             substr(plf_r.crawstr, 1, instr(plf_r.crawstr, ';', 1, 9)) || -- до PAN - карты
+
+             substr(substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 9) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1 
+             ),1,6) || -- первые 6 
+                   
+             rpad('*', length(substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 9) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1) 
+                        )-10,'*') ||      -- ****        
+                   
+             substr(substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 9) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1 
+             ),-4) ||    -- последние 4             
+                    
+             substr(plf_r.crawstr, instr(plf_r.crawstr, ';', 1, 10)) as data_str, -- зашифрованный PAN в строке данных,
+                   
+             pm.mplesum as sum_profit,                -- Сумма дохода с операции
+                   
+             substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 3) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 4) - instr(plf_r.crawstr, ';', 1, 3) -1 
+             ) as TransactionNumber,                  -- Номер транзакции(уникальный)
+                   
+                   
+             to_number(rpad(substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 9) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1 
+             ), 19, '0')) as Full_CardNumber19, -- , 19, '0'), '9999999999999999999'
+                   
+             substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 30) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 31) - instr(plf_r.crawstr, ';', 1, 30) -1 
+             ) as CorrespondingAccount
+                  
+                                  
+    from xxi.pl_file_in plf join xxi.pl_file_raw plf_r on (plf.ifileinid = plf_r.ifileinid)
+                            left join xxi.pl_msg_merch pmm on (plf_r.ifileinid = pmm.ifileinid and plf_r.irawline = pmm.imsgline)
+                            left join pl_atm pa on (pmm.cmsgnumcontr = pa.cplatmcod)
+                left join xxi.pl_op_rec_m porm on (pmm.imsgfinid = porm.imsgrecid)
+                left join xxi.ple_m pm on (porm.ioprecid = pm.ioprecid and pm.ipletype in (1043,66))
+                                  
+    where (upper(substr(plf.cfileinname,1,3)) = upper('MTL')) and
+          (upper(substr(plf_r.crawstr,1,2)) = upper('TR')) and
+            (pa.IPLATMTYPE = 3 or pa.IPLATMTYPE is null) and
+        (plf.dfileinload >= date_beg and plf.dfileinload <= date_end)
+        --(plf.dfileinload >= to_date(date_beg, 'dd.mm.yyyy')) and (plf.dfileinload <= to_date(date_end, 'dd.mm.yyyy')) --and
+        --plf_r.irawline <= 100
+          
+    order by plf.ifileinid, plf.cfileinname, plf.dfileinload, plf_r.irawline
+
+) data
+-- join тип карты
+left join mtl_ctl_corresponding_account ca on (data.CorrespondingAccount = ca.correspondingaccount);  
+
+commit;
+
+/* 	
+	разделяем карты КубаньКредит и остальные, соответственно раскраска продуктами раздельная.
+	(Раздельная, потому что в mtl_ctl_productcardstype используется привязка к типу карты VISA, MASTERCARD, МИР)
+	
+	После этого делаем Union КубаньКредит и остальные.
+	*/
+
+--	****************************отбираем карты Кроме Кубань кредит****************************
+execute immediate 'truncate table MTL_CTL_OTHERS';
+
+--наполняем временную MTL_Others и джойним code_a4, BIN_LEN и PRODUCT ID
+insert into mtl_ctl_others (transactionnumber,
+                        full_cardnumber19,
+                        cardnumber_type,
+                        code_a3,
+                        bin_len,
+                        product_id)
+
+ select mt.TransactionNumber, 
+        mt.Full_CardNumber19, 
+        UPPER(trim(mt.CardNumber_Type)),
+        mb.code_a3,
+        mb.bin_len,
+        trim(mb.product_id)
+ from mtl_ctl_temp mt left join mtl_ctl_bintab mb on (mt.CardNumber_Type = mb.cardnumber_type and 
+                                                (mt.Full_CardNumber19 between mb.start_bin and mb.end_bin)
+                                                )
+ where mt.CardNumber_Type <> 'КУБАНЬ КРЕДИТ';
+
+commit;
+
+--	****************************отбираем карты Кубань кредит****************************
+
+execute immediate 'truncate table MTL_KK';
+
+insert into mtl_kk (transactionnumber,
+                        full_cardnumber19,
+                        cardnumber_type,
+                        code_a3,
+                        bin_len,
+                        product_id)
+
+ select mt.TransactionNumber, 
+        mt.Full_CardNumber19, 
+        UPPER(trim(mt.CardNumber_Type)),
+        mb.code_a3,
+        mb.bin_len,
+        trim(mb.product_id)
+ from mtl_ctl_temp mt left join mtl_ctl_bintab mb on (mt.Full_CardNumber19 between mb.start_bin and mb.end_bin)
+                                               
+ where mt.CardNumber_Type = 'КУБАНЬ КРЕДИТ';
+
+commit;
+
+
+
+/**отбираем все с максимальным BIN_LEN и джойним code_a3 и product_id к ним;
+*добавляем вес продукта для отбора с Минимальным ProductID_weight
+*джойним product_id из mtl_ctl_productcardstype
+*производим вставку в конечную таблицу mtl_data
+
+P.S.Для карт КК и других алгоритм алгоритм немного различен(из за отсутствия типа карты у карт КК)
+Поэтому вычисляются раздельно, а затем UNION mtl_others и mtl_kk
+
+*/
+
+insert into mtl_data(id_file, name_file, date_file_load, num_line_in_file, data_str, sum_profit, cardnumber_type, code_a3, product_id_final, product_id_description)
+
+select mt.ID_FILE,
+       mt.NAME_FILE,
+       mt.DATE_FILE_LOAD,
+       mt.NUM_LINE_IN_FILE,
+       mt.DATA_STR,
+       mt.SUM_PROFIT,
+       mt.CARDNUMBER_TYPE,
+       nvl(mtl_with_product.code_a3, 'No_ProductType'),
+       nvl(mtl_with_product.productid, 'No_ProductType'),
+       nvl(mtl_with_product.description, 'No_ProductType')
+       
+from mtl_ctl_temp mt left join       
+(
+  select TransactionNumber, code_a3, productid, description 
+  from
+  (
+        --для mtl_others
+        select mtl_oth.TransactionNumber, mtl_oth.Full_CardNumber19, mtl_oth.CardNumber_Type, mtl_oth.bin_len, mtl_oth.code_a3, mtl_oth.productid_weight,
+               mp.productid, mp.description
+        from
+        (
+            select mtl_oth.TransactionNumber, mtl_oth.Full_CardNumber19, mtl_oth.CardNumber_Type, mtl_oth.bin_len, mtl_oth.code_a3,
+                   min(mp.productid_weight) as productid_weight
+            from (
+                  
+                  select aggr_mo.TransactionNumber, aggr_mo.Full_CardNumber19, aggr_mo.CardNumber_Type, aggr_mo.bin_len,
+                         mo.code_a3, mo.product_id
+                  from
+                  (
+                    select TransactionNumber, Full_CardNumber19, CardNumber_Type, max(bin_len) as bin_len
+                    from mtl_ctl_others
+                    group by TransactionNumber, Full_CardNumber19, CardNumber_Type
+                  ) aggr_mo left join mtl_ctl_others mo on (aggr_mo.TransactionNumber = mo.transactionnumber and
+                                                        aggr_mo.Full_CardNumber19 = mo.Full_CardNumber19 and
+                                                        aggr_mo.CardNumber_Type = mo.CardNumber_Type and
+                                                        aggr_mo.bin_len = mo.bin_len)	   
+                  
+            ) mtl_oth left join mtl_ctl_productcardstype mp on (mtl_oth.CardNumber_Type = mp.typecard and mtl_oth.product_id = mp.productid )
+
+            group by mtl_oth.TransactionNumber, mtl_oth.Full_CardNumber19, mtl_oth.CardNumber_Type, mtl_oth.code_a3, mtl_oth.bin_len
+
+        ) mtl_oth left join mtl_ctl_productcardstype mp on (mtl_oth.productid_weight = mp.productid_weight)
+
+
+        union -- объединяем mtl_others и mtl_kk
+
+        --для mtl_kk
+        select mtl_kk.TransactionNumber, mtl_kk.Full_CardNumber19, mtl_kk.CardNumber_Type, mtl_kk.bin_len, mtl_kk.code_a3, mtl_kk.productid_weight,
+
+               mp.productid, mp.description
+        from
+        (
+            select mtl_kk.TransactionNumber, mtl_kk.Full_CardNumber19, mtl_kk.CardNumber_Type, mtl_kk.bin_len, mtl_kk.code_a3,
+                   min(mp.productid_weight) as productid_weight
+            from (
+
+                  select aggr_mk.TransactionNumber, aggr_mk.Full_CardNumber19, aggr_mk.CardNumber_Type, aggr_mk.bin_len,
+                         mk.code_a3, mk.product_id
+                  from
+                  (
+                    select TransactionNumber, Full_CardNumber19, CardNumber_Type, max(bin_len) as bin_len
+                    from mtl_kk
+                    group by TransactionNumber, Full_CardNumber19, CardNumber_Type
+                  ) aggr_mk left join mtl_kk mk on (aggr_mk.TransactionNumber = mk.transactionnumber and
+                                                        aggr_mk.Full_CardNumber19 = mk.Full_CardNumber19 and
+                                                        aggr_mk.CardNumber_Type = mk.CardNumber_Type and
+                                                        aggr_mk.bin_len = mk.bin_len)	   
+
+            ) mtl_kk left join mtl_ctl_productcardstype mp on (mtl_kk.product_id = mp.productid )
+
+            group by mtl_kk.TransactionNumber, mtl_kk.Full_CardNumber19, mtl_kk.CardNumber_Type, mtl_kk.code_a3, mtl_kk.bin_len
+
+        ) mtl_kk left join mtl_ctl_productcardstype mp on (mtl_kk.productid_weight = mp.productid_weight)
+
+  )mtl_with_product
+
+)mtl_with_product on (mt.TRANSACTIONNUMBER = mtl_with_product.TransactionNumber);
+
+commit;
+
+end load_MTL;
+
+--основной блок обработки CTL
+procedure Main_Load_CTL(start_date in date, end_date in date) is
+begin
+  
+  --очищаем перегружаемые данные
+  MTL.ClearCTLData(start_date, end_date);
+  --основная процедура по обезличиванию номера карты, присваивания продукта карте и сохранение операции в основную таблицу CTL_DATA
+  MTL.load_CTL(start_date, end_date);
+  
+end Main_Load_CTL;
+
+--очистка перегружаемых данных таблицы CTL_DATA
+procedure ClearCTLData(start_date in date, end_date in date)is
+begin
+  delete from CTL_DATA where date_file_load between start_date and end_date;
+  commit;
+end ClearCTLData;
+
+--основная процедура по обезличиванию номера карты в операции и присвоению операции продукта для CTL
+procedure load_CTL(date_beg in date, date_end in date) is
+
+begin
+  
+-- подготовка обрабатываемых операций;
+execute immediate 'truncate table MTL_CTL_TEMP';
+
+insert into MTL_CTL_TEMP (ID_FILE,
+                          NAME_FILE,
+                          DATE_FILE_LOAD,
+                          NUM_LINE_IN_FILE,
+                          DATA_STR,
+                          SUM_PROFIT,
+                          TRANSACTIONNUMBER,
+                          FULL_CARDNUMBER19,
+                          CORRESPONDINGACCOUNT,
+                          CARDNUMBER_TYPE)
+
+select id_file,
+       name_file,
+       date_file_load,
+       num_line_in_file,
+       data_str,
+       nvl(sum_profit, 0) as sum_profit, -- сумма дохода с операции 0, т.к. доходы находятся в CTP
+       TransactionNumber,
+       Full_CardNumber19,
+       CorrespondingAccount,
+       ca.type_card as CardNumber_Type      
+       
+from
+(       
+select plf.ifileinid as id_file,               -- ИД файла
+           plf.cfileinname as name_file,           -- Имя файла
+             plf.dfileinload as date_file_load,      -- Дата загрузки
+             plf_r.irawline as num_line_in_file,     -- Номер строки
+             --plf_r.crawstr as data_str,              -- Строка файла -- необходимо вырезать
+             -- шифруем PAN в операции
+             substr(plf_r.crawstr, 1, instr(plf_r.crawstr, ';', 1, 9)) || -- до PAN - карты
+
+             substr(substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 9) + 1,
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1
+             ),1,6) || -- первые 6
+                   
+             rpad('*', length(substr(plf_r.crawstr,
+                        instr(plf_r.crawstr, ';', 1, 9) + 1,
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1)
+                        )-10,'*') ||      -- ****        
+                   
+             substr(substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 9) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1 
+             ),-4) ||    -- последние 4             
+                    
+             substr(plf_r.crawstr, instr(plf_r.crawstr, ';', 1, 10)) as data_str, -- зашифрованный PAN в строке данных,
+                   
+             pm.mplesum as sum_profit,                -- Сумма дохода с операции
+                   
+             substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 3) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 4) - instr(plf_r.crawstr, ';', 1, 3) -1 
+             ) as TransactionNumber,                  -- Номер транзакции(уникальный)
+                   
+                   
+             to_number(rpad(substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 9) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 10) - instr(plf_r.crawstr, ';', 1, 9) -1 
+             ), 19, '0')) as Full_CardNumber19, -- , 19, '0'), '9999999999999999999'
+                   
+             substr(plf_r.crawstr, 
+                        instr(plf_r.crawstr, ';', 1, 30) + 1, 
+                        instr(plf_r.crawstr, ';', 1, 31) - instr(plf_r.crawstr, ';', 1, 30) -1 
+             ) as CorrespondingAccount  
+    
+    from xxi.pl_file_in plf join xxi.pl_file_raw plf_r on (plf.ifileinid = plf_r.ifileinid)
+                            left join xxi.pl_msg_merch pmm on (plf_r.ifileinid = pmm.ifileinid and plf_r.irawline = pmm.imsgline)
+                            left join xxi.pl_op_rec_m porm on (pmm.imsgfinid = porm.imsgrecid)
+                            left join xxi.ple_m pm on (porm.ioprecid = pm.ioprecid)                            
+                            
+    where (upper(substr(plf.cfileinname,1,3)) = upper('CTL')) and
+          (upper(substr(plf_r.crawstr,1,2)) = upper('TR')) and
+          (plf.dfileinload >= date_beg and plf.dfileinload <= date_end)          
+    order by plf.dfileinload, plf.cfileinname, plf.dfileinload, plf_r.irawline
+                              
+                                  
+
+) data
+
+left join mtl_ctl_corresp_acc_kk ca on (data.Full_CardNumber19 like rpad(ca.bin, 19 ,'_'));
+
+commit; 
+
+--****************************наполняем временную CTL_Others и джойним code_a4, BIN_LEN и PRODUCT ID****************************
+execute immediate 'truncate table MTL_CTL_OTHERS';
+
+insert into mtl_ctl_others (transactionnumber,
+                        full_cardnumber19,
+                        cardnumber_type,
+                        code_a3,
+                        bin_len,
+                        product_id)
+
+ select ct.TransactionNumber, 
+        ct.Full_CardNumber19, 
+        UPPER(trim(ct.CardNumber_Type)),
+        mb.code_a3,
+        mb.bin_len,
+        trim(mb.product_id)
+ from mtl_ctl_temp ct left join mtl_ctl_bintab mb on (ct.CardNumber_Type = mb.cardnumber_type and 
+                                                (ct.Full_CardNumber19 between mb.start_bin and mb.end_bin)
+                                                );
+commit;
+
+
+/**отбираем все с максимальным BIN_LEN и джойним code_a3 и product_id к ним;
+*добавляем вес продукта для отбора с Минимальным ProductID_weight
+*джойним product_id из mtl_ctl_productcardstype
+*производим вставку в конечную таблицу сtl_data
+*также добавляем 2 вариант определения продукта (из таблиц plc, pl_p)
+*/
+
+insert into ctl_data(id_file, name_file, date_file_load, num_line_in_file, data_str, sum_profit, cardnumber_type, 
+                     code_a3, product_id_final, product_id_description,
+                     product_id_final2, product_id_description2)
+
+select ct.ID_FILE,
+       ct.NAME_FILE,
+       ct.DATE_FILE_LOAD,
+       ct.NUM_LINE_IN_FILE,
+       ct.DATA_STR,
+       ct.SUM_PROFIT,
+       ct.CARDNUMBER_TYPE,
+       nvl(ctl_with_product.code_a3, 'No_ProductType'),
+       nvl(ctl_with_product.productid, 'No_ProductType'),
+       nvl(ctl_with_product.description, 'No_ProductType'),
+       nvl(ctl_with_product.cplpcardfile, 'No_ProductType'),
+       nvl(ctl_with_product.cplpname, 'No_ProductType')
+       
+from mtl_ctl_temp ct left join       
+(
+  select TransactionNumber, code_a3, productid, description, cplpcardfile, cplpname 
+  from
+  (
+        select ctl_oth.TransactionNumber, ctl_oth.Full_CardNumber19, ctl_oth.CardNumber_Type, ctl_oth.bin_len, ctl_oth.code_a3, ctl_oth.productid_weight,
+               cp.productid, cp.description, plastik.cplpcardfile, plastik.cplpname
+        from
+        (
+            select ctl_oth.TransactionNumber, ctl_oth.Full_CardNumber19, ctl_oth.CardNumber_Type, ctl_oth.bin_len, ctl_oth.code_a3,
+                   min(cp.productid_weight) as productid_weight
+            from (
+                  
+                  select aggr_co.TransactionNumber, aggr_co.Full_CardNumber19, aggr_co.CardNumber_Type, aggr_co.bin_len,
+                         mo.code_a3, mo.product_id
+                  from
+                  (
+                    select TransactionNumber, Full_CardNumber19, CardNumber_Type, max(bin_len) as bin_len
+                    from mtl_ctl_others
+                    group by TransactionNumber, Full_CardNumber19, CardNumber_Type
+                  ) aggr_co left join mtl_ctl_others mo on (aggr_co.TransactionNumber = mo.transactionnumber and
+                                                        aggr_co.Full_CardNumber19 = mo.Full_CardNumber19 and
+                                                        aggr_co.CardNumber_Type = mo.CardNumber_Type and
+                                                        aggr_co.bin_len = mo.bin_len)	   
+                  
+            ) ctl_oth left join mtl_ctl_productcardstype cp on (ctl_oth.CardNumber_Type = cp.typecard and ctl_oth.product_id = cp.productid )
+
+            group by ctl_oth.TransactionNumber, ctl_oth.Full_CardNumber19, ctl_oth.CardNumber_Type, ctl_oth.code_a3, ctl_oth.bin_len
+
+        ) ctl_oth left join mtl_ctl_productcardstype cp on (ctl_oth.productid_weight = cp.productid_weight)
+                  left join 
+                            ( select plc.CPLCNUM, pl_p.cplpcardfile, pl_p.cplpname 
+                              from plc join pl_p on (plc.IPLPID = pl_p.iplpid)
+                            ) plastik on (to_char(ctl_oth.Full_CardNumber19) = rpad(to_char(plastik.CPLCNUM), 19, '0')) 
+
+  )ctl_with_product
+
+)ctl_with_product on (ct.TRANSACTIONNUMBER = ctl_with_product.TransactionNumber);
+
+commit;                       
+
+end load_CTL;
+
+end MTL;
